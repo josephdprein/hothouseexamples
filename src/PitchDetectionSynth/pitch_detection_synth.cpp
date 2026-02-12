@@ -301,6 +301,7 @@ q::ar_envelope_follower *input_env = nullptr;
 // Synth state
 float detected_freq = 0.0f;
 bool gate_open = false;
+bool prev_gate = false;
 
 constexpr int waveforms[] = {
     Oscillator::WAVE_SIN,
@@ -365,11 +366,14 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     fs2_hold_ms = 0.0f;
   }
 
-  // When bypassed, pass dry input + reverb tail (delays cut immediately)
+  // When bypassed, pass dry input + reverb tail (delays cut immediately).
+  // Keep feeding the pitch detector so it stays locked when re-engaged.
   if (!effect_active) {
     led1_val = 0.0f;
     led2_val = 0.0f;
     for (size_t i = 0; i < size; i++) {
+      (*pd)(in[0][i]);
+
       float rev_l = 0.0f, rev_r = 0.0f;
       reverb.Process(0.0f, 0.0f, &rev_l, &rev_r);
       out[0][i] = out[1][i] = std::clamp(in[0][i] + rev_l, -1.0f, 1.0f);
@@ -473,16 +477,17 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     }
 
     // LFO 1 trigger sync: reset phase on gate rising edge
-    static bool prev_gate = false;
     if (lfo1_trig_sync && gate_open && !prev_gate)
       lfos[0].Reset();
     prev_gate = gate_open;
 
-    // Pitch detection
+    // Pitch detection with light smoothing to reduce octave-jump glitches.
+    // Coefficient of 0.15 converges quickly (~6 samples to within 2%) while
+    // rejecting single-sample outliers from the autocorrelation detector.
     (*pd)(input);
     float freq = pd->get_frequency();
     if (freq > 0.0f) {
-      detected_freq = freq;
+      detected_freq += 0.15f * (freq - detected_freq);
       osc.SetFreq(detected_freq);
     }
 

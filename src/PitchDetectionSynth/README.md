@@ -25,7 +25,10 @@ Four knob banks are selected by the combination of Toggle Switches 2 and 3. When
 | UP | DOWN | **C** — Delays |
 | DOWN | DOWN | **D** — LFOs |
 
-MIDDLE position on either switch is treated the same as UP.
+MIDDLE position on either switch is treated the same as UP for bank selection, but enables additional features:
+
+- **SW2 MIDDLE** — LFO 1 modulates **pitch** instead of filter cutoff (when mod is active)
+- **SW3 MIDDLE** — LFO 1 **resets phase** on each note onset (trigger sync)
 
 ### Bank A — Synth (SW2 UP, SW3 UP)
 
@@ -98,7 +101,7 @@ Three sine-wave LFOs in vertical pairs (rate on top row, depth on bottom row):
 | SWITCH 2 | BANK SELECT (row) | Combined with Switch 3 — see bank table above |
 | SWITCH 3 | BANK SELECT (col) | Combined with Switch 2 — see bank table above |
 | FOOTSWITCH 1 | MOD / FREEZE | Short press toggles LFO modulation (LED 1 = active). Hold to freeze delay lines — buffers loop without updating. Long press (2s) = bootloader mode |
-| FOOTSWITCH 2 | BYPASS | Short press toggles effect on/off. LED 2 lights when active (effect engaged). |
+| FOOTSWITCH 2 | BYPASS / SUSTAIN | Short press toggles effect on/off. **Hold** to force infinite sustain — the ADSR gate stays open regardless of input level. LED 2 lights when active (effect engaged). |
 
 ## Tips
 
