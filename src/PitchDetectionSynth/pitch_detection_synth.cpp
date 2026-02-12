@@ -42,6 +42,9 @@ static constexpr size_t XFADE_SAMPLES = 256;
 // Minimum useful delay (1ms) — below this, output silence
 static constexpr size_t MIN_DELAY_SAMPLES = 48;
 
+// Bank indices
+enum Bank { BANK_A = 0, BANK_B, BANK_C, BANK_D };
+
 // ----- Bidirectional delay line (forward + chunk-based reverse) -----
 //
 // Delay time knob behavior:
@@ -146,6 +149,13 @@ Adsr env;
 
 BiDirDelay delay1, delay2;
 
+// 3 LFOs: filter cutoff, delay 1 time, delay 2 time
+Oscillator lfo1, lfo2, lfo3;
+
+// Modulation on/off (footswitch 1)
+bool mod_active = false;
+Led led_mod;
+
 // Knob parameters — Bank A (synth)
 Parameter p_cutoff, p_res, p_attack, p_decay, p_sustain, p_release;
 
@@ -155,6 +165,10 @@ Parameter p_sensitivity, p_drywet;
 // Knob parameters — Bank C (delays)
 Parameter p_d1_time, p_d1_vol, p_d1_fb;
 Parameter p_d2_time, p_d2_vol, p_d2_fb;
+
+// Knob parameters — Bank D (LFOs, vertical pairs: rate=top, depth=bottom)
+Parameter p_lfo1_rate, p_lfo2_rate, p_lfo3_rate;
+Parameter p_lfo1_depth, p_lfo2_depth, p_lfo3_depth;
 
 // Pitch detection (allocated in main, guitar range 80Hz–1200Hz)
 q::pitch_detector *pd = nullptr;
@@ -180,6 +194,13 @@ float latch_d2_time = 0.5f;
 float latch_d2_vol = 0.5f;
 float latch_d2_fb = 0.3f;
 
+float latch_lfo1_rate = 1.0f;
+float latch_lfo1_depth = 0.0f;
+float latch_lfo2_rate = 1.0f;
+float latch_lfo2_depth = 0.0f;
+float latch_lfo3_rate = 1.0f;
+float latch_lfo3_depth = 0.0f;
+
 // Synth state
 float detected_freq = 0.0f;
 bool gate_open = false;
@@ -190,18 +211,38 @@ const int waveforms[] = {
     Oscillator::WAVE_POLYBLEP_SAW,
 };
 
+// Determine which bank is active from two toggle switches
+//   SW2 UP   + SW3 UP   = A
+//   SW2 DOWN + SW3 UP   = B
+//   SW2 UP   + SW3 DOWN = C
+//   SW2 DOWN + SW3 DOWN = D
+// MIDDLE on either switch is treated as UP.
+static Bank GetBank() {
+  bool sw2_down = (hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_2) ==
+                   Hothouse::TOGGLESWITCH_DOWN);
+  bool sw3_down = (hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_3) ==
+                   Hothouse::TOGGLESWITCH_DOWN);
+  if (!sw2_down && !sw3_down)
+    return BANK_A;
+  if (sw2_down && !sw3_down)
+    return BANK_B;
+  if (!sw2_down && sw3_down)
+    return BANK_C;
+  return BANK_D;
+}
+
 void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
                    size_t size) {
   hw.ProcessAllControls();
 
-  // Toggle 2: knob bank select
-  //   UP (0) = Bank A (synth)
-  //   MIDDLE (1) = Bank B (detection/mix)
-  //   DOWN (2) = Bank C (delays)
-  int bank = hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_2);
+  // Footswitch 1: toggle modulation on/off
+  mod_active ^= hw.switches[Hothouse::FOOTSWITCH_1].RisingEdge();
+
+  // Bank selection via switch 2 + switch 3 combo
+  Bank bank = GetBank();
 
   switch (bank) {
-  case 0: // Bank A — synth
+  case BANK_A: // Synth
     latch_cutoff = p_cutoff.Process();
     latch_res = p_res.Process();
     latch_attack = p_attack.Process();
@@ -209,17 +250,25 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     latch_sustain = p_sustain.Process();
     latch_release = p_release.Process();
     break;
-  case 1: // Bank B — detection/mix
+  case BANK_B: // Detection/mix
     latch_sensitivity = p_sensitivity.Process();
     latch_drywet = p_drywet.Process();
     break;
-  case 2: // Bank C — delays
+  case BANK_C: // Delays
     latch_d1_time = p_d1_time.Process();
     latch_d1_vol = p_d1_vol.Process();
     latch_d1_fb = p_d1_fb.Process();
     latch_d2_time = p_d2_time.Process();
     latch_d2_vol = p_d2_vol.Process();
     latch_d2_fb = p_d2_fb.Process();
+    break;
+  case BANK_D: // LFOs
+    latch_lfo1_rate = p_lfo1_rate.Process();
+    latch_lfo2_rate = p_lfo2_rate.Process();
+    latch_lfo3_rate = p_lfo3_rate.Process();
+    latch_lfo1_depth = p_lfo1_depth.Process();
+    latch_lfo2_depth = p_lfo2_depth.Process();
+    latch_lfo3_depth = p_lfo3_depth.Process();
     break;
   }
 
@@ -232,6 +281,11 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
   // Toggle 1: waveform select
   osc.SetWaveform(
       waveforms[hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_1)]);
+
+  // Update LFO rates
+  lfo1.SetFreq(latch_lfo1_rate);
+  lfo2.SetFreq(latch_lfo2_rate);
+  lfo3.SetFreq(latch_lfo3_rate);
 
   // Onset threshold with hysteresis
   float onset_thresh = latch_sensitivity;
@@ -262,9 +316,18 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     // ADSR: gate=true while input is present, releases when signal drops
     float env_out = env.Process(gate_open);
 
-    // Filter modulated by envelope
+    // Process LFOs (always running so phase stays continuous)
+    float lfo1_val = lfo1.Process();
+    float lfo2_val = lfo2.Process();
+    float lfo3_val = lfo3.Process();
+
+    // Filter cutoff: envelope modulation + optional LFO 1
     float cutoff_mod = latch_cutoff * env_out;
-    flt.SetFreq(cutoff_mod);
+    if (mod_active) {
+      // Bipolar: depth=0 → no mod, depth=1 → cutoff sweeps 0x–2x
+      cutoff_mod *= (1.0f + lfo1_val * latch_lfo1_depth);
+    }
+    flt.SetFreq(std::max(cutoff_mod, 20.0f));
     flt.SetRes(latch_res);
 
     // Synth output
@@ -273,9 +336,20 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     // Dry/wet mix
     float mixed = input * (1.0f - latch_drywet) + synth_out * latch_drywet;
 
+    // Delay times: base value + optional LFO 2/3
+    float d1t = latch_d1_time;
+    float d2t = latch_d2_time;
+    if (mod_active) {
+      // LFO modulates ±50% of knob range at max depth
+      d1t += lfo2_val * latch_lfo2_depth * 0.5f;
+      d1t = std::max(0.0f, std::min(1.0f, d1t));
+      d2t += lfo3_val * latch_lfo3_depth * 0.5f;
+      d2t = std::max(0.0f, std::min(1.0f, d2t));
+    }
+
     // Two parallel delay lines fed from post-mix signal
-    float d1_out = delay1.Process(mixed, latch_d1_time, latch_d1_fb);
-    float d2_out = delay2.Process(mixed, latch_d2_time, latch_d2_fb);
+    float d1_out = delay1.Process(mixed, d1t, latch_d1_fb);
+    float d2_out = delay2.Process(mixed, d2t, latch_d2_fb);
 
     float final_out = mixed + d1_out * latch_d1_vol + d2_out * latch_d2_vol;
 
@@ -314,6 +388,23 @@ int main() {
   p_d2_vol.Init(hw.knobs[Hothouse::KNOB_5], 0.0f, 1.0f, Parameter::LINEAR);
   p_d2_fb.Init(hw.knobs[Hothouse::KNOB_6], 0.0f, 0.95f, Parameter::LINEAR);
 
+  // Bank D: LFO parameters (vertical pairs — rate on top row, depth on bottom)
+  //   Knob 1 / 4 = LFO 1 (filter)
+  //   Knob 2 / 5 = LFO 2 (delay 1 time)
+  //   Knob 3 / 6 = LFO 3 (delay 2 time)
+  p_lfo1_rate.Init(hw.knobs[Hothouse::KNOB_1], 0.05f, 20.0f,
+                   Parameter::LOGARITHMIC);
+  p_lfo2_rate.Init(hw.knobs[Hothouse::KNOB_2], 0.05f, 20.0f,
+                   Parameter::LOGARITHMIC);
+  p_lfo3_rate.Init(hw.knobs[Hothouse::KNOB_3], 0.05f, 20.0f,
+                   Parameter::LOGARITHMIC);
+  p_lfo1_depth.Init(hw.knobs[Hothouse::KNOB_4], 0.0f, 1.0f,
+                    Parameter::LINEAR);
+  p_lfo2_depth.Init(hw.knobs[Hothouse::KNOB_5], 0.0f, 1.0f,
+                    Parameter::LINEAR);
+  p_lfo3_depth.Init(hw.knobs[Hothouse::KNOB_6], 0.0f, 1.0f,
+                    Parameter::LINEAR);
+
   // Pitch detector: guitar range ~80Hz (low E) to ~1200Hz (high frets)
   static q::pitch_detector pitch_det{80_Hz, 1200_Hz, sr, -30_dB};
   pd = &pitch_det;
@@ -322,7 +413,7 @@ int main() {
   static q::ar_envelope_follower env_fol{1_ms, 100_ms, sr};
   input_env = &env_fol;
 
-  // Oscillator
+  // Synth oscillator
   osc.Init(sr);
   osc.SetWaveform(Oscillator::WAVE_POLYBLEP_SAW);
 
@@ -337,14 +428,37 @@ int main() {
   env.SetSustainLevel(0.8f);
   env.SetReleaseTime(0.3f);
 
+  // LFO oscillators (sine wave)
+  lfo1.Init(sr);
+  lfo1.SetWaveform(Oscillator::WAVE_SIN);
+  lfo1.SetFreq(1.0f);
+  lfo1.SetAmp(1.0f);
+
+  lfo2.Init(sr);
+  lfo2.SetWaveform(Oscillator::WAVE_SIN);
+  lfo2.SetFreq(1.0f);
+  lfo2.SetAmp(1.0f);
+
+  lfo3.Init(sr);
+  lfo3.SetWaveform(Oscillator::WAVE_SIN);
+  lfo3.SetFreq(1.0f);
+  lfo3.SetAmp(1.0f);
+
   // Delay lines — buffers live in SDRAM
   delay1.Init(delay_buf_1);
   delay2.Init(delay_buf_2);
+
+  // Modulation LED (LED 1 / left footswitch LED)
+  led_mod.Init(hw.seed.GetPin(Hothouse::LED_1), false);
 
   hw.StartAdc();
   hw.StartAudio(AudioCallback);
 
   while (true) {
+    // Update mod LED
+    led_mod.Set(mod_active ? 1.0f : 0.0f);
+    led_mod.Update();
+
     hw.DelayMs(10);
     hw.CheckResetToBootloader();
   }

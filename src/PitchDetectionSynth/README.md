@@ -4,7 +4,7 @@ Based on BasicSynth by Cleveland Music Co. \<<code@clevelandmusicco.com>\>
 
 ## Description
 
-A pitch-tracking monophonic synthesizer with dual bidirectional delay lines. Plug in a guitar (or any monophonic source) and the synth follows the input pitch in real time. No MIDI or USB host required — just audio in, synth out.
+A pitch-tracking monophonic synthesizer with dual bidirectional delay lines and LFO modulation. Plug in a guitar (or any monophonic source) and the synth follows the input pitch in real time. No MIDI or USB host required — just audio in, synth out.
 
 **How it works:**
 - **Pitch detection** (Cycfi Q library autocorrelation) extracts the fundamental frequency from the audio input
@@ -12,29 +12,33 @@ A pitch-tracking monophonic synthesizer with dual bidirectional delay lines. Plu
 - The detected pitch drives the oscillator; the last confident pitch is held when detection confidence drops
 - **ADSR envelope** sustains as long as the input signal is present, then releases when the signal drops
 - **Two parallel delay lines** with forward and reverse modes feed from the post-mix signal
-
-The synth features multiple waveforms, a Moog-style ladder filter, a dry/wet mix, and two independently configurable delay lines that can each run forward or reversed.
+- **Three sine LFOs** modulate the filter cutoff and both delay times, toggled on/off via footswitch
 
 ## Controls
 
-Toggle Switch 2 selects between three knob banks. When you switch banks, the other banks' parameters hold their last values.
+Four knob banks are selected by the combination of Toggle Switches 2 and 3. When you switch banks, the other banks' parameters hold their last values.
 
-- **Bank A** (UP) — Synth engine
-- **Bank B** (MIDDLE) — Detection sensitivity and mix
-- **Bank C** (DOWN) — Dual delay lines
+| SW 2 | SW 3 | Bank |
+|------|------|------|
+| UP | UP | **A** — Synth |
+| DOWN | UP | **B** — Detection/Mix |
+| UP | DOWN | **C** — Delays |
+| DOWN | DOWN | **D** — LFOs |
 
-### Bank A — Synth (Toggle 2 UP)
+MIDDLE position on either switch is treated the same as UP.
+
+### Bank A — Synth (SW2 UP, SW3 UP)
 
 | CONTROL | DESCRIPTION | NOTES |
 |-|-|-|
-| KNOB 1 | FILTER | Moog ladder filter cutoff, 20Hz to 20kHz (modulated by envelope) |
+| KNOB 1 | FILTER | Moog ladder filter cutoff, 20Hz to 20kHz (modulated by envelope + LFO 1) |
 | KNOB 2 | RESONANCE | Filter resonance 0.0–1.0. High resonance + low frequencies can clip! |
 | KNOB 3 | ATTACK | ADSR attack time, 0.001 to 0.5 sec |
 | KNOB 4 | DECAY | ADSR decay time, 0.05 to 2 sec |
 | KNOB 5 | SUSTAIN | ADSR sustain level, 0.0 to 1.0 |
 | KNOB 6 | RELEASE | ADSR release time, 0.05 to 2 sec |
 
-### Bank B — Detection/Mix (Toggle 2 MIDDLE)
+### Bank B — Detection/Mix (SW2 DOWN, SW3 UP)
 
 | CONTROL | DESCRIPTION | NOTES |
 |-|-|-|
@@ -42,7 +46,7 @@ Toggle Switch 2 selects between three knob banks. When you switch banks, the oth
 | KNOB 2 | DRY/WET | 0.0 = input only, 1.0 = synth only. Defaults to full wet |
 | KNOB 3–6 | Unused | |
 
-### Bank C — Delays (Toggle 2 DOWN)
+### Bank C — Delays (SW2 UP, SW3 DOWN)
 
 Each delay line's time knob is bidirectional around noon:
 
@@ -60,14 +64,37 @@ Each delay line's time knob is bidirectional around noon:
 | KNOB 5 | DELAY 2 VOLUME | Return level of delay 2 output, 0.0–1.0 |
 | KNOB 6 | DELAY 2 FEEDBACK | 0.0–0.95 |
 
-### Switches
+### Bank D — LFOs (SW2 DOWN, SW3 DOWN)
+
+Three sine-wave LFOs in vertical pairs (rate on top row, depth on bottom row):
+
+```
+  KNOB 1         KNOB 2         KNOB 3
+  LFO 1 Rate     LFO 2 Rate     LFO 3 Rate
+  (filter)       (delay 1)      (delay 2)
+
+  KNOB 4         KNOB 5         KNOB 6
+  LFO 1 Depth    LFO 2 Depth    LFO 3 Depth
+  (filter)       (delay 1)      (delay 2)
+```
+
+| CONTROL | DESCRIPTION | NOTES |
+|-|-|-|
+| KNOB 1 | LFO 1 RATE | Filter cutoff modulation rate, 0.05–20 Hz |
+| KNOB 2 | LFO 2 RATE | Delay 1 time modulation rate, 0.05–20 Hz |
+| KNOB 3 | LFO 3 RATE | Delay 2 time modulation rate, 0.05–20 Hz |
+| KNOB 4 | LFO 1 DEPTH | Filter cutoff mod depth. Fully CCW = no modulation |
+| KNOB 5 | LFO 2 DEPTH | Delay 1 time mod depth. Fully CCW = no modulation |
+| KNOB 6 | LFO 3 DEPTH | Delay 2 time mod depth. Fully CCW = no modulation |
+
+### Switches and Footswitches
 
 | CONTROL | DESCRIPTION | NOTES |
 |-|-|-|
 | SWITCH 1 | WAVEFORM | **UP** — Sine, **MIDDLE** — PolyBLEP Square, **DOWN** — PolyBLEP Saw |
-| SWITCH 2 | KNOB BANK | **UP** — Bank A (synth), **MIDDLE** — Bank B (detection/mix), **DOWN** — Bank C (delays) |
-| SWITCH 3 | Unused | |
-| FOOTSWITCH 1 | RESET | Hold 2 seconds for bootloader mode |
+| SWITCH 2 | BANK SELECT (row) | Combined with Switch 3 — see bank table above |
+| SWITCH 3 | BANK SELECT (col) | Combined with Switch 2 — see bank table above |
+| FOOTSWITCH 1 | MOD ON/OFF | Short press toggles LFO modulation. LED 1 lights when active. Long press (2s) = bootloader mode |
 | FOOTSWITCH 2 | Unused | |
 
 ## Tips
@@ -79,21 +106,26 @@ Each delay line's time knob is bidirectional around noon:
 - **Reverse delay** works best with longer delay times — short reverse chunks can sound glitchy (which may be what you want)
 - Try one delay forward and one reversed for ambient/textural sounds
 - The delays run in parallel and sum with the dry signal, so watch your output level with both volumes up
+- LFO on the filter creates classic auto-wah and filter sweep effects
+- LFO on delay times creates chorus-like pitch modulation effects — try slow rates with subtle depth
+- All depth knobs at fully CCW = zero modulation, so you can set rates first then bring in depth to taste
 
 ## Signal Flow
 
 ```
 Guitar In → Pitch Detect + Envelope Follow
                 ↓
-           Oscillator → Moog Ladder Filter → ADSR Envelope
-                ↓
-           Dry/Wet Mix (input + synth)
-                ↓
-           ┌─── Delay 1 (forward or reverse) ───┐
-           ├─── Delay 2 (forward or reverse) ───┤
-           └─── Dry signal ─────────────────────┘
-                ↓ (summed)
-           Stereo Output
+           Oscillator → Moog Ladder Filter ←── LFO 1 (when mod active)
+                            ↓
+                       ADSR Envelope
+                            ↓
+                       Dry/Wet Mix (input + synth)
+                            ↓
+           ┌─── Delay 1 (fwd/rev) ←── LFO 2 (when mod active) ───┐
+           ├─── Delay 2 (fwd/rev) ←── LFO 3 (when mod active) ───┤
+           └─── Dry signal ───────────────────────────────────────┘
+                            ↓ (summed)
+                       Stereo Output
 ```
 
 ## Dependencies
