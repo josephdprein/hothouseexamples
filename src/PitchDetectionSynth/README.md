@@ -47,7 +47,7 @@ MIDDLE position on either switch is treated the same as UP.
 | KNOB 3 | REVERB SEND | How much signal is sent to the reverb, 0.0–1.0. Fully CCW = no reverb |
 | KNOB 4 | REVERB DECAY | Reverb tail length (feedback), 0.3–0.999. Higher = longer decay |
 | KNOB 5 | REVERB TONE | Reverb low-pass filter, 500 Hz–16 kHz. Lower = darker reverb |
-| KNOB 6 | Unused | |
+| KNOB 6 | GAIN | Pre-delay gain stage. Noon = unity, CCW = attenuate to silence, CW = tanh soft saturation |
 
 ### Bank C — Delays (SW2 UP, SW3 DOWN)
 

@@ -208,6 +208,7 @@ struct {
   float rev_send = 0.0f;
   float rev_decay = 0.85f;
   float rev_tone = 10000.0f;
+  float gain = 0.5f;
 } detect;
 
 struct {
@@ -224,8 +225,8 @@ struct {
 // Knob parameters — Bank A (synth)
 Parameter p_cutoff, p_res, p_attack, p_decay, p_sustain, p_release;
 
-// Knob parameters — Bank B (detection/mix/reverb)
-Parameter p_sensitivity, p_drywet, p_rev_send, p_rev_decay, p_rev_tone;
+// Knob parameters — Bank B (detection/mix/reverb/gain)
+Parameter p_sensitivity, p_drywet, p_rev_send, p_rev_decay, p_rev_tone, p_gain;
 
 // Knob parameters — Bank C (delays: 3 knobs per delay line)
 Parameter p_d_time[NUM_DELAYS], p_d_vol[NUM_DELAYS], p_d_fb[NUM_DELAYS];
@@ -313,6 +314,7 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     if (pk.Moved(2)) detect.rev_send = p_rev_send.Process();
     if (pk.Moved(3)) detect.rev_decay = p_rev_decay.Process();
     if (pk.Moved(4)) detect.rev_tone = p_rev_tone.Process();
+    if (pk.Moved(5)) detect.gain = p_gain.Process();
     break;
   case BANK_C:
     for (int j = 0; j < NUM_DELAYS; j++) {
@@ -397,6 +399,15 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     // Dry/wet mix
     float mixed = input * (1.0f - detect.drywet) + synth_out * detect.drywet;
 
+    // Gain stage: knob at noon (0.5) = unity, CCW = attenuate, CW = tanh overdrive
+    float g = detect.gain;
+    if (g <= 0.5f) {
+      mixed *= g * 2.0f;
+    } else {
+      float drive = 1.0f + (g - 0.5f) * 18.0f;
+      mixed = std::tanh(mixed * drive);
+    }
+
     // Two parallel delay lines fed from post-mix signal
     // LFO 2 and 3 optionally modulate delay 1 and 2 times
     float d_out[NUM_DELAYS];
@@ -450,6 +461,7 @@ int main() {
                    Parameter::LOGARITHMIC);
   p_rev_tone.Init(hw.knobs[Hothouse::KNOB_5], 500.0f, 16000.0f,
                   Parameter::LOGARITHMIC);
+  p_gain.Init(hw.knobs[Hothouse::KNOB_6], 0.0f, 1.0f, Parameter::LINEAR);
 
   // Bank C: delay parameters (3 knobs per delay line)
   p_d_time[0].Init(hw.knobs[Hothouse::KNOB_1], 0.0f, 1.0f, Parameter::LINEAR);
