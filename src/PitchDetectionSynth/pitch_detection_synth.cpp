@@ -22,6 +22,7 @@
 #include <q/fx/envelope.hpp>
 #include <q/support/literals.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
@@ -34,9 +35,11 @@ using namespace q::literals;
 
 // 2000ms at 48kHz
 static constexpr size_t MAX_DELAY_SAMPLES = 96000;
-// 2x buffer for reverse mode headroom
-static constexpr size_t DELAY_BUF_SIZE = 192000;
-// Crossfade at reverse chunk boundaries (~5ms)
+// Reverse mode reads at offset 1 + 2*(chunk_size-1) from write_pos,
+// requiring a buffer of at least 2 * MAX_DELAY_SAMPLES.
+static constexpr size_t DELAY_BUF_SIZE = 2 * MAX_DELAY_SAMPLES;
+// Target crossfade at reverse chunk boundaries (~5ms); shortened
+// automatically when the chunk is smaller than 2 * XFADE_SAMPLES.
 static constexpr size_t XFADE_SAMPLES = 256;
 // Minimum useful delay (1ms)
 static constexpr size_t MIN_DELAY_SAMPLES = 48;
@@ -45,9 +48,11 @@ static constexpr size_t MIN_DELAY_SAMPLES = 48;
 static constexpr float PICKUP_THRESHOLD = 0.03f;
 
 static constexpr int NUM_KNOBS = 6;
+static constexpr int NUM_DELAYS = 2;
+static constexpr int NUM_LFOS = 3;
 
 // Bank indices
-enum Bank { BANK_A = 0, BANK_B, BANK_C, BANK_D };
+enum Bank { BANK_A = 0, BANK_B, BANK_C, BANK_D, NUM_BANKS };
 
 Hothouse hw;
 
@@ -80,7 +85,7 @@ struct KnobPickup {
   }
 };
 
-KnobPickup pickup[4]; // one per bank
+KnobPickup pickup[NUM_BANKS];
 
 // ----- Bidirectional delay line (forward + chunk-based reverse) -----
 
@@ -141,16 +146,22 @@ struct BiDirDelay {
       size_t read_pos = (write_pos + DELAY_BUF_SIZE - offset) % DELAY_BUF_SIZE;
       out = buffer[read_pos];
 
-      if (rev_phase < XFADE_SAMPLES) {
-        out *= static_cast<float>(rev_phase) / XFADE_SAMPLES;
-      } else if (rev_phase >= chunk_size - XFADE_SAMPLES) {
-        out *= static_cast<float>(chunk_size - 1 - rev_phase) / XFADE_SAMPLES;
+      // Shorten crossfade when the chunk is too small for the full window,
+      // preventing unsigned underflow in the fade-out comparison.
+      size_t fade_len = std::min(XFADE_SAMPLES, chunk_size / 2);
+      if (fade_len > 0) {
+        if (rev_phase < fade_len) {
+          out *= static_cast<float>(rev_phase) / static_cast<float>(fade_len);
+        } else if (rev_phase >= chunk_size - fade_len) {
+          out *= static_cast<float>(chunk_size - 1 - rev_phase) /
+                 static_cast<float>(fade_len);
+        }
       }
 
       rev_phase++;
     }
 
-    float fb = std::max(0.0f, std::min(feedback, 0.95f));
+    float fb = std::clamp(feedback, 0.0f, 0.95f);
     buffer[write_pos] = in + out * fb;
     write_pos = (write_pos + 1) % DELAY_BUF_SIZE;
 
@@ -164,17 +175,47 @@ Oscillator osc;
 MoogLadder flt;
 Adsr env;
 
-BiDirDelay delay1, delay2;
+BiDirDelay delays[NUM_DELAYS];
 
 // Reverb (SDRAM for internal buffers)
 ReverbSc DSY_SDRAM_BSS reverb;
 
 // 3 LFOs: filter cutoff, delay 1 time, delay 2 time
-Oscillator lfo1, lfo2, lfo3;
+Oscillator lfos[NUM_LFOS];
 
 // Modulation on/off (footswitch 1)
 bool mod_active = false;
 Led led_mod;
+
+// ----- Latched parameter values (persist across bank switches) -----
+
+struct {
+  float cutoff = 1000.0f;
+  float res = 0.7f;
+  float attack = 0.01f;
+  float decay = 0.1f;
+  float sustain = 0.8f;
+  float release = 0.3f;
+} synth;
+
+struct {
+  float sensitivity = 0.02f;
+  float drywet = 1.0f;
+  float rev_send = 0.0f;
+  float rev_decay = 0.85f;
+  float rev_tone = 10000.0f;
+} detect;
+
+struct {
+  float time[NUM_DELAYS] = {0.5f, 0.5f};
+  float vol[NUM_DELAYS] = {0.5f, 0.5f};
+  float fb[NUM_DELAYS] = {0.3f, 0.3f};
+} dly;
+
+struct {
+  float rate[NUM_LFOS] = {1.0f, 1.0f, 1.0f};
+  float depth[NUM_LFOS] = {0.0f, 0.0f, 0.0f};
+} lfo;
 
 // Knob parameters — Bank A (synth)
 Parameter p_cutoff, p_res, p_attack, p_decay, p_sustain, p_release;
@@ -182,13 +223,11 @@ Parameter p_cutoff, p_res, p_attack, p_decay, p_sustain, p_release;
 // Knob parameters — Bank B (detection/mix/reverb)
 Parameter p_sensitivity, p_drywet, p_rev_send, p_rev_decay, p_rev_tone;
 
-// Knob parameters — Bank C (delays)
-Parameter p_d1_time, p_d1_vol, p_d1_fb;
-Parameter p_d2_time, p_d2_vol, p_d2_fb;
+// Knob parameters — Bank C (delays: 3 knobs per delay line)
+Parameter p_d_time[NUM_DELAYS], p_d_vol[NUM_DELAYS], p_d_fb[NUM_DELAYS];
 
-// Knob parameters — Bank D (LFOs, vertical pairs: rate=top, depth=bottom)
-Parameter p_lfo1_rate, p_lfo2_rate, p_lfo3_rate;
-Parameter p_lfo1_depth, p_lfo2_depth, p_lfo3_depth;
+// Knob parameters — Bank D (LFOs: rate on top row, depth on bottom)
+Parameter p_lfo_rate[NUM_LFOS], p_lfo_depth[NUM_LFOS];
 
 // Pitch detection
 q::pitch_detector *pd = nullptr;
@@ -196,39 +235,11 @@ q::pitch_detector *pd = nullptr;
 // Envelope follower for onset/offset detection
 q::ar_envelope_follower *input_env = nullptr;
 
-// Latched parameter values (persist across bank switches)
-float latch_cutoff = 1000.0f;
-float latch_res = 0.7f;
-float latch_attack = 0.01f;
-float latch_decay = 0.1f;
-float latch_sustain = 0.8f;
-float latch_release = 0.3f;
-
-float latch_sensitivity = 0.02f;
-float latch_drywet = 1.0f;
-float latch_rev_send = 0.0f;
-float latch_rev_decay = 0.85f;
-float latch_rev_tone = 10000.0f;
-
-float latch_d1_time = 0.5f;
-float latch_d1_vol = 0.5f;
-float latch_d1_fb = 0.3f;
-float latch_d2_time = 0.5f;
-float latch_d2_vol = 0.5f;
-float latch_d2_fb = 0.3f;
-
-float latch_lfo1_rate = 1.0f;
-float latch_lfo1_depth = 0.0f;
-float latch_lfo2_rate = 1.0f;
-float latch_lfo2_depth = 0.0f;
-float latch_lfo3_rate = 1.0f;
-float latch_lfo3_depth = 0.0f;
-
 // Synth state
 float detected_freq = 0.0f;
 bool gate_open = false;
 
-const int waveforms[] = {
+constexpr int waveforms[] = {
     Oscillator::WAVE_SIN,
     Oscillator::WAVE_POLYBLEP_SQUARE,
     Oscillator::WAVE_POLYBLEP_SAW,
@@ -275,59 +286,57 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
 
   switch (bank) {
   case BANK_A:
-    if (pk.Moved(0)) latch_cutoff = p_cutoff.Process();
-    if (pk.Moved(1)) latch_res = p_res.Process();
-    if (pk.Moved(2)) latch_attack = p_attack.Process();
-    if (pk.Moved(3)) latch_decay = p_decay.Process();
-    if (pk.Moved(4)) latch_sustain = p_sustain.Process();
-    if (pk.Moved(5)) latch_release = p_release.Process();
+    if (pk.Moved(0)) synth.cutoff = p_cutoff.Process();
+    if (pk.Moved(1)) synth.res = p_res.Process();
+    if (pk.Moved(2)) synth.attack = p_attack.Process();
+    if (pk.Moved(3)) synth.decay = p_decay.Process();
+    if (pk.Moved(4)) synth.sustain = p_sustain.Process();
+    if (pk.Moved(5)) synth.release = p_release.Process();
     break;
   case BANK_B:
-    if (pk.Moved(0)) latch_sensitivity = p_sensitivity.Process();
-    if (pk.Moved(1)) latch_drywet = p_drywet.Process();
-    if (pk.Moved(2)) latch_rev_send = p_rev_send.Process();
-    if (pk.Moved(3)) latch_rev_decay = p_rev_decay.Process();
-    if (pk.Moved(4)) latch_rev_tone = p_rev_tone.Process();
+    if (pk.Moved(0)) detect.sensitivity = p_sensitivity.Process();
+    if (pk.Moved(1)) detect.drywet = p_drywet.Process();
+    if (pk.Moved(2)) detect.rev_send = p_rev_send.Process();
+    if (pk.Moved(3)) detect.rev_decay = p_rev_decay.Process();
+    if (pk.Moved(4)) detect.rev_tone = p_rev_tone.Process();
     break;
   case BANK_C:
-    if (pk.Moved(0)) latch_d1_time = p_d1_time.Process();
-    if (pk.Moved(1)) latch_d1_vol = p_d1_vol.Process();
-    if (pk.Moved(2)) latch_d1_fb = p_d1_fb.Process();
-    if (pk.Moved(3)) latch_d2_time = p_d2_time.Process();
-    if (pk.Moved(4)) latch_d2_vol = p_d2_vol.Process();
-    if (pk.Moved(5)) latch_d2_fb = p_d2_fb.Process();
+    for (int j = 0; j < NUM_DELAYS; j++) {
+      if (pk.Moved(j * 3 + 0)) dly.time[j] = p_d_time[j].Process();
+      if (pk.Moved(j * 3 + 1)) dly.vol[j] = p_d_vol[j].Process();
+      if (pk.Moved(j * 3 + 2)) dly.fb[j] = p_d_fb[j].Process();
+    }
     break;
   case BANK_D:
-    if (pk.Moved(0)) latch_lfo1_rate = p_lfo1_rate.Process();
-    if (pk.Moved(1)) latch_lfo2_rate = p_lfo2_rate.Process();
-    if (pk.Moved(2)) latch_lfo3_rate = p_lfo3_rate.Process();
-    if (pk.Moved(3)) latch_lfo1_depth = p_lfo1_depth.Process();
-    if (pk.Moved(4)) latch_lfo2_depth = p_lfo2_depth.Process();
-    if (pk.Moved(5)) latch_lfo3_depth = p_lfo3_depth.Process();
+    for (int j = 0; j < NUM_LFOS; j++) {
+      if (pk.Moved(j)) lfo.rate[j] = p_lfo_rate[j].Process();
+      if (pk.Moved(j + 3)) lfo.depth[j] = p_lfo_depth[j].Process();
+    }
+    break;
+  default:
     break;
   }
 
   // Apply ADSR parameters
-  env.SetAttackTime(latch_attack);
-  env.SetDecayTime(latch_decay);
-  env.SetSustainLevel(latch_sustain);
-  env.SetReleaseTime(latch_release);
+  env.SetAttackTime(synth.attack);
+  env.SetDecayTime(synth.decay);
+  env.SetSustainLevel(synth.sustain);
+  env.SetReleaseTime(synth.release);
 
   // Toggle 1: waveform select
   osc.SetWaveform(
       waveforms[hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_1)]);
 
   // Update LFO rates
-  lfo1.SetFreq(latch_lfo1_rate);
-  lfo2.SetFreq(latch_lfo2_rate);
-  lfo3.SetFreq(latch_lfo3_rate);
+  for (int j = 0; j < NUM_LFOS; j++)
+    lfos[j].SetFreq(lfo.rate[j]);
 
   // Update reverb parameters
-  reverb.SetFeedback(latch_rev_decay);
-  reverb.SetLpFreq(latch_rev_tone);
+  reverb.SetFeedback(detect.rev_decay);
+  reverb.SetLpFreq(detect.rev_tone);
 
   // Onset threshold with hysteresis
-  float onset_thresh = latch_sensitivity;
+  float onset_thresh = detect.sensitivity;
   float release_thresh = onset_thresh * 0.3f;
 
   for (size_t i = 0; i < size; ++i) {
@@ -356,43 +365,42 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     float env_out = env.Process(gate_open);
 
     // Process LFOs (always running so phase stays continuous)
-    float lfo1_val = lfo1.Process();
-    float lfo2_val = lfo2.Process();
-    float lfo3_val = lfo3.Process();
+    float lfo_val[NUM_LFOS];
+    for (int j = 0; j < NUM_LFOS; j++)
+      lfo_val[j] = lfos[j].Process();
 
     // Filter cutoff: envelope modulation + optional LFO 1
-    float cutoff_mod = latch_cutoff * env_out;
+    float cutoff_mod = synth.cutoff * env_out;
     if (mod_active) {
-      cutoff_mod *= (1.0f + lfo1_val * latch_lfo1_depth);
+      cutoff_mod *= (1.0f + lfo_val[0] * lfo.depth[0]);
     }
     flt.SetFreq(std::max(cutoff_mod, 20.0f));
-    flt.SetRes(latch_res);
+    flt.SetRes(synth.res);
 
     // Synth output
     float synth_out = flt.Process(osc.Process()) * env_out;
 
     // Dry/wet mix
-    float mixed = input * (1.0f - latch_drywet) + synth_out * latch_drywet;
-
-    // Delay times: base value + optional LFO 2/3
-    float d1t = latch_d1_time;
-    float d2t = latch_d2_time;
-    if (mod_active) {
-      d1t += lfo2_val * latch_lfo2_depth * 0.5f;
-      d1t = std::max(0.0f, std::min(1.0f, d1t));
-      d2t += lfo3_val * latch_lfo3_depth * 0.5f;
-      d2t = std::max(0.0f, std::min(1.0f, d2t));
-    }
+    float mixed = input * (1.0f - detect.drywet) + synth_out * detect.drywet;
 
     // Two parallel delay lines fed from post-mix signal
-    float d1_out = delay1.Process(mixed, d1t, latch_d1_fb);
-    float d2_out = delay2.Process(mixed, d2t, latch_d2_fb);
+    // LFO 2 and 3 optionally modulate delay 1 and 2 times
+    float d_out[NUM_DELAYS];
+    for (int j = 0; j < NUM_DELAYS; j++) {
+      float dt = dly.time[j];
+      if (mod_active)
+        dt = std::clamp(dt + lfo_val[j + 1] * lfo.depth[j + 1] * 0.5f,
+                        0.0f, 1.0f);
+      d_out[j] = delays[j].Process(mixed, dt, dly.fb[j]);
+    }
 
-    float pre_verb = mixed + d1_out * latch_d1_vol + d2_out * latch_d2_vol;
+    float pre_verb = mixed;
+    for (int j = 0; j < NUM_DELAYS; j++)
+      pre_verb += d_out[j] * dly.vol[j];
 
     // Reverb (stereo in, stereo out — we feed mono and take one channel)
     float rev_out_l = 0.0f, rev_out_r = 0.0f;
-    float rev_in = pre_verb * latch_rev_send;
+    float rev_in = pre_verb * detect.rev_send;
     reverb.Process(rev_in, rev_in, &rev_out_l, &rev_out_r);
 
     float final_out = pre_verb + rev_out_l;
@@ -429,27 +437,21 @@ int main() {
   p_rev_tone.Init(hw.knobs[Hothouse::KNOB_5], 500.0f, 16000.0f,
                   Parameter::LOGARITHMIC);
 
-  // Bank C: delay parameters
-  p_d1_time.Init(hw.knobs[Hothouse::KNOB_1], 0.0f, 1.0f, Parameter::LINEAR);
-  p_d1_vol.Init(hw.knobs[Hothouse::KNOB_2], 0.0f, 1.0f, Parameter::LINEAR);
-  p_d1_fb.Init(hw.knobs[Hothouse::KNOB_3], 0.0f, 0.95f, Parameter::LINEAR);
-  p_d2_time.Init(hw.knobs[Hothouse::KNOB_4], 0.0f, 1.0f, Parameter::LINEAR);
-  p_d2_vol.Init(hw.knobs[Hothouse::KNOB_5], 0.0f, 1.0f, Parameter::LINEAR);
-  p_d2_fb.Init(hw.knobs[Hothouse::KNOB_6], 0.0f, 0.95f, Parameter::LINEAR);
+  // Bank C: delay parameters (3 knobs per delay line)
+  p_d_time[0].Init(hw.knobs[Hothouse::KNOB_1], 0.0f, 1.0f, Parameter::LINEAR);
+  p_d_vol[0].Init(hw.knobs[Hothouse::KNOB_2], 0.0f, 1.0f, Parameter::LINEAR);
+  p_d_fb[0].Init(hw.knobs[Hothouse::KNOB_3], 0.0f, 0.95f, Parameter::LINEAR);
+  p_d_time[1].Init(hw.knobs[Hothouse::KNOB_4], 0.0f, 1.0f, Parameter::LINEAR);
+  p_d_vol[1].Init(hw.knobs[Hothouse::KNOB_5], 0.0f, 1.0f, Parameter::LINEAR);
+  p_d_fb[1].Init(hw.knobs[Hothouse::KNOB_6], 0.0f, 0.95f, Parameter::LINEAR);
 
-  // Bank D: LFO parameters (vertical pairs — rate on top row, depth on bottom)
-  p_lfo1_rate.Init(hw.knobs[Hothouse::KNOB_1], 0.05f, 20.0f,
-                   Parameter::LOGARITHMIC);
-  p_lfo2_rate.Init(hw.knobs[Hothouse::KNOB_2], 0.05f, 20.0f,
-                   Parameter::LOGARITHMIC);
-  p_lfo3_rate.Init(hw.knobs[Hothouse::KNOB_3], 0.05f, 20.0f,
-                   Parameter::LOGARITHMIC);
-  p_lfo1_depth.Init(hw.knobs[Hothouse::KNOB_4], 0.0f, 1.0f,
-                    Parameter::LINEAR);
-  p_lfo2_depth.Init(hw.knobs[Hothouse::KNOB_5], 0.0f, 1.0f,
-                    Parameter::LINEAR);
-  p_lfo3_depth.Init(hw.knobs[Hothouse::KNOB_6], 0.0f, 1.0f,
-                    Parameter::LINEAR);
+  // Bank D: LFO parameters (rate on top row, depth on bottom)
+  for (int j = 0; j < NUM_LFOS; j++) {
+    p_lfo_rate[j].Init(hw.knobs[Hothouse::KNOB_1 + j], 0.05f, 20.0f,
+                       Parameter::LOGARITHMIC);
+    p_lfo_depth[j].Init(hw.knobs[Hothouse::KNOB_4 + j], 0.0f, 1.0f,
+                        Parameter::LINEAR);
+  }
 
   // Pitch detector: guitar range ~80Hz (low E) to ~1200Hz (high frets)
   static q::pitch_detector pitch_det{80_Hz, 1200_Hz, sr, -30_dB};
@@ -475,24 +477,17 @@ int main() {
   env.SetReleaseTime(0.3f);
 
   // LFO oscillators (sine wave)
-  lfo1.Init(sr);
-  lfo1.SetWaveform(Oscillator::WAVE_SIN);
-  lfo1.SetFreq(1.0f);
-  lfo1.SetAmp(1.0f);
-
-  lfo2.Init(sr);
-  lfo2.SetWaveform(Oscillator::WAVE_SIN);
-  lfo2.SetFreq(1.0f);
-  lfo2.SetAmp(1.0f);
-
-  lfo3.Init(sr);
-  lfo3.SetWaveform(Oscillator::WAVE_SIN);
-  lfo3.SetFreq(1.0f);
-  lfo3.SetAmp(1.0f);
+  for (int j = 0; j < NUM_LFOS; j++) {
+    lfos[j].Init(sr);
+    lfos[j].SetWaveform(Oscillator::WAVE_SIN);
+    lfos[j].SetFreq(1.0f);
+    lfos[j].SetAmp(1.0f);
+  }
 
   // Delay lines
-  delay1.Init(delay_buf_1);
-  delay2.Init(delay_buf_2);
+  float *delay_bufs[] = {delay_buf_1, delay_buf_2};
+  for (int j = 0; j < NUM_DELAYS; j++)
+    delays[j].Init(delay_bufs[j]);
 
   // Reverb
   reverb.Init(sr);
@@ -500,7 +495,7 @@ int main() {
   reverb.SetLpFreq(10000.0f);
 
   // Initialize pickup state — mark all knobs as picked up for starting bank
-  for (int b = 0; b < 4; b++) {
+  for (int b = 0; b < NUM_BANKS; b++) {
     for (int k = 0; k < NUM_KNOBS; k++) {
       pickup[b].picked_up[k] = (b == BANK_A); // only bank A starts active
       pickup[b].entry_pos[k] = 0.0f;
@@ -520,5 +515,4 @@ int main() {
     hw.DelayMs(10);
     hw.CheckResetToBootloader();
   }
-  return 0;
 }

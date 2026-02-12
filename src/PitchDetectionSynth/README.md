@@ -138,4 +138,8 @@ Guitar In → Pitch Detect + Envelope Follow
 
 ## Dependencies
 
-Uses the [Cycfi Q DSP library](https://github.com/cycfi/q) (MIT license) for pitch detection and envelope following, included via the buzzbox_octa_squawker submodule.
+Uses the [Cycfi Q DSP library](https://github.com/cycfi/q) (MIT license) for pitch detection and envelope following, included via the buzzbox_octa_squawker submodule. Make sure the submodule and its nested dependencies are initialized before building:
+
+```sh
+git submodule update --init --recursive
+```
