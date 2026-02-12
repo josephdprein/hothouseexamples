@@ -98,6 +98,8 @@ struct BiDirDelay {
   size_t rev_phase;
   size_t prev_chunk_size;
   size_t freeze_phase;
+  size_t fwd_counter;
+  float cycle_phase;   // 0–1 position in delay cycle, -1 if inactive
 
   void Init(float *buf) {
     buffer = buf;
@@ -106,6 +108,8 @@ struct BiDirDelay {
     rev_phase = 0;
     prev_chunk_size = 0;
     freeze_phase = 0;
+    fwd_counter = 0;
+    cycle_phase = -1.0f;
   }
 
   float Process(float in, float delay_knob, float feedback, bool frozen) {
@@ -122,6 +126,8 @@ struct BiDirDelay {
       }
       rev_phase = 0;
       freeze_phase = 0;
+      fwd_counter = 0;
+      cycle_phase = -1.0f;
       return 0.0f;
     }
 
@@ -159,6 +165,8 @@ struct BiDirDelay {
       }
 
       freeze_phase = (freeze_phase + 1) % delay_samples;
+      cycle_phase = static_cast<float>(freeze_phase) /
+                    static_cast<float>(delay_samples);
       return out;
     }
 
@@ -170,6 +178,9 @@ struct BiDirDelay {
           (write_pos + DELAY_BUF_SIZE - delay_samples) % DELAY_BUF_SIZE;
       out = buffer[read_pos];
       rev_phase = 0;
+      fwd_counter = (fwd_counter + 1) % delay_samples;
+      cycle_phase = static_cast<float>(fwd_counter) /
+                    static_cast<float>(delay_samples);
     } else {
       size_t chunk_size = delay_samples;
 
@@ -199,6 +210,9 @@ struct BiDirDelay {
       }
 
       rev_phase++;
+      fwd_counter = 0;
+      cycle_phase = static_cast<float>(rev_phase % chunk_size) /
+                    static_cast<float>(chunk_size);
     }
 
     float fb = std::clamp(feedback, 0.0f, 0.95f);
@@ -230,6 +244,10 @@ Led led_mod;
 // Effect bypass (footswitch 2)
 bool effect_active = true;
 Led led_bypass;
+
+// LED brightness (written by audio callback, read by main loop)
+float led1_val = 0.0f;
+float led2_val = 0.0f;
 
 // ----- Latched parameter values (persist across bank switches) -----
 
@@ -337,6 +355,8 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
 
   // When bypassed, pass dry input + reverb tail (delays cut immediately)
   if (!effect_active) {
+    led1_val = 0.0f;
+    led2_val = 0.0f;
     for (size_t i = 0; i < size; i++) {
       float rev_l = 0.0f, rev_r = 0.0f;
       reverb.Process(0.0f, 0.0f, &rev_l, &rev_r);
@@ -413,6 +433,10 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
   float onset_thresh = detect.sensitivity;
   float release_thresh = onset_thresh * 0.3f;
 
+  float last_env_out = 0.0f;
+  float last_lfo_val[NUM_LFOS] = {};
+  float block_peak = 0.0f;
+
   for (size_t i = 0; i < size; ++i) {
     float input = in[0][i];
     float abs_input = std::abs(input);
@@ -437,11 +461,14 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
 
     // ADSR
     float env_out = env.Process(gate_open);
+    last_env_out = env_out;
 
     // Process LFOs (always running so phase stays continuous)
     float lfo_val[NUM_LFOS];
     for (int j = 0; j < NUM_LFOS; j++)
       lfo_val[j] = lfos[j].Process();
+    for (int j = 0; j < NUM_LFOS; j++)
+      last_lfo_val[j] = lfo_val[j];
 
     // Filter cutoff: envelope modulation + optional LFO 1
     float cutoff_mod = synth.cutoff * env_out;
@@ -490,6 +517,33 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     float final_out = pre_verb + rev_out_l;
 
     out[0][i] = out[1][i] = std::clamp(final_out, -1.0f, 1.0f);
+    block_peak = std::max(block_peak, std::abs(final_out));
+  }
+
+  // Update LED brightness based on current bank
+  switch (bank) {
+  case BANK_A:
+    led1_val = last_env_out;
+    led2_val = effect_active ? 1.0f : 0.0f;
+    break;
+  case BANK_B:
+    led1_val = gate_open ? 1.0f : 0.0f;
+    led2_val = std::min(block_peak * 1.5f, 1.0f);
+    break;
+  case BANK_C:
+    led1_val = (delays[0].cycle_phase >= 0.0f && delays[0].cycle_phase < 0.15f)
+                   ? 1.0f
+                   : 0.0f;
+    led2_val = (delays[1].cycle_phase >= 0.0f && delays[1].cycle_phase < 0.15f)
+                   ? 1.0f
+                   : 0.0f;
+    break;
+  case BANK_D:
+    led1_val = 0.5f + 0.5f * last_lfo_val[1] * lfo.depth[1];
+    led2_val = 0.5f + 0.5f * last_lfo_val[2] * lfo.depth[2];
+    break;
+  default:
+    break;
   }
 }
 
@@ -597,9 +651,9 @@ int main() {
   hw.StartAudio(AudioCallback);
 
   while (true) {
-    led_mod.Set(mod_active ? 1.0f : 0.0f);
+    led_mod.Set(led1_val);
     led_mod.Update();
-    led_bypass.Set(effect_active ? 1.0f : 0.0f);
+    led_bypass.Set(led2_val);
     led_bypass.Update();
 
     hw.DelayMs(10);
