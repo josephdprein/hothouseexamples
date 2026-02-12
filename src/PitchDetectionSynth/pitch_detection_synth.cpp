@@ -335,10 +335,13 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
   // Footswitch 2: toggle effect bypass
   effect_active ^= hw.switches[Hothouse::FOOTSWITCH_2].RisingEdge();
 
-  // When bypassed, pass dry input straight through
+  // When bypassed, pass dry input + reverb tail (delays cut immediately)
   if (!effect_active) {
-    for (size_t i = 0; i < size; i++)
-      out[0][i] = out[1][i] = in[0][i];
+    for (size_t i = 0; i < size; i++) {
+      float rev_l = 0.0f, rev_r = 0.0f;
+      reverb.Process(0.0f, 0.0f, &rev_l, &rev_r);
+      out[0][i] = out[1][i] = std::clamp(in[0][i] + rev_l, -1.0f, 1.0f);
+    }
     return;
   }
 
@@ -460,7 +463,8 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
       mixed *= g * 2.0f;
     } else {
       float drive = 1.0f + (g - 0.5f) * 18.0f;
-      mixed = std::tanh(mixed * drive);
+      float x = mixed * drive;
+      mixed = x / (1.0f + std::abs(x)); // fast tanh approx
     }
 
     // Two parallel delay lines fed from post-mix signal
@@ -485,7 +489,7 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
 
     float final_out = pre_verb + rev_out_l;
 
-    out[0][i] = out[1][i] = final_out;
+    out[0][i] = out[1][i] = std::clamp(final_out, -1.0f, 1.0f);
   }
 }
 
