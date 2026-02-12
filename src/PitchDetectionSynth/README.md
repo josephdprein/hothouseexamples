@@ -43,11 +43,11 @@ MIDDLE position on either switch is treated the same as UP.
 | CONTROL | DESCRIPTION | NOTES |
 |-|-|-|
 | KNOB 1 | SENSITIVITY | Onset detection threshold. Lower = more sensitive, higher = rejects noise. Range 0.001 to 0.1 |
-| KNOB 2 | DRY/WET | 0.0 = input only, 1.0 = synth only. Defaults to full wet |
-| KNOB 3 | REVERB SEND | How much signal is sent to the reverb, 0.0–1.0. Fully CCW = no reverb |
-| KNOB 4 | REVERB DECAY | Reverb tail length (feedback), 0.3–0.999. Higher = longer decay |
-| KNOB 5 | REVERB TONE | Reverb low-pass filter, 500 Hz–16 kHz. Lower = darker reverb |
-| KNOB 6 | GAIN | Pre-delay gain stage. Noon = unity, CCW = attenuate to silence, CW = tanh soft saturation |
+| KNOB 2 | GAIN | Pre-delay gain stage. Noon = unity, CCW = attenuate to silence, CW = tanh soft saturation |
+| KNOB 3 | DRY/WET | 0.0 = input only, 1.0 = synth only. Defaults to full wet |
+| KNOB 4 | REVERB SEND | How much signal is sent to the reverb, 0.0–1.0. Fully CCW = no reverb |
+| KNOB 5 | REVERB DECAY | Reverb tail length (feedback), 0.3–0.999. Higher = longer decay |
+| KNOB 6 | REVERB TONE | Reverb low-pass filter, 500 Hz–16 kHz. Lower = darker reverb |
 
 ### Bank C — Delays (SW2 UP, SW3 DOWN)
 

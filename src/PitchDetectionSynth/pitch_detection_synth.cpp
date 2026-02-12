@@ -310,11 +310,11 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     break;
   case BANK_B:
     if (pk.Moved(0)) detect.sensitivity = p_sensitivity.Process();
-    if (pk.Moved(1)) detect.drywet = p_drywet.Process();
-    if (pk.Moved(2)) detect.rev_send = p_rev_send.Process();
-    if (pk.Moved(3)) detect.rev_decay = p_rev_decay.Process();
-    if (pk.Moved(4)) detect.rev_tone = p_rev_tone.Process();
-    if (pk.Moved(5)) detect.gain = p_gain.Process();
+    if (pk.Moved(1)) detect.gain = p_gain.Process();
+    if (pk.Moved(2)) detect.drywet = p_drywet.Process();
+    if (pk.Moved(3)) detect.rev_send = p_rev_send.Process();
+    if (pk.Moved(4)) detect.rev_decay = p_rev_decay.Process();
+    if (pk.Moved(5)) detect.rev_tone = p_rev_tone.Process();
     break;
   case BANK_C:
     for (int j = 0; j < NUM_DELAYS; j++) {
@@ -452,16 +452,16 @@ int main() {
   p_release.Init(hw.knobs[Hothouse::KNOB_6], 0.05f, 2.0f,
                  Parameter::LOGARITHMIC);
 
-  // Bank B: detection/mix/reverb parameters
+  // Bank B: detection/gain/mix/reverb parameters
   p_sensitivity.Init(hw.knobs[Hothouse::KNOB_1], 0.001f, 0.1f,
                      Parameter::LOGARITHMIC);
-  p_drywet.Init(hw.knobs[Hothouse::KNOB_2], 0.0f, 1.0f, Parameter::LINEAR);
-  p_rev_send.Init(hw.knobs[Hothouse::KNOB_3], 0.0f, 1.0f, Parameter::LINEAR);
-  p_rev_decay.Init(hw.knobs[Hothouse::KNOB_4], 0.3f, 0.999f,
+  p_gain.Init(hw.knobs[Hothouse::KNOB_2], 0.0f, 1.0f, Parameter::LINEAR);
+  p_drywet.Init(hw.knobs[Hothouse::KNOB_3], 0.0f, 1.0f, Parameter::LINEAR);
+  p_rev_send.Init(hw.knobs[Hothouse::KNOB_4], 0.0f, 1.0f, Parameter::LINEAR);
+  p_rev_decay.Init(hw.knobs[Hothouse::KNOB_5], 0.3f, 0.999f,
                    Parameter::LOGARITHMIC);
-  p_rev_tone.Init(hw.knobs[Hothouse::KNOB_5], 500.0f, 16000.0f,
+  p_rev_tone.Init(hw.knobs[Hothouse::KNOB_6], 500.0f, 16000.0f,
                   Parameter::LOGARITHMIC);
-  p_gain.Init(hw.knobs[Hothouse::KNOB_6], 0.0f, 1.0f, Parameter::LINEAR);
 
   // Bank C: delay parameters (3 knobs per delay line)
   p_d_time[0].Init(hw.knobs[Hothouse::KNOB_1], 0.0f, 1.0f, Parameter::LINEAR);
