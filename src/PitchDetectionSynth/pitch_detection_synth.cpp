@@ -97,6 +97,7 @@ struct BiDirDelay {
   size_t write_pos;
   size_t rev_phase;
   size_t prev_chunk_size;
+  size_t freeze_phase;
 
   void Init(float *buf) {
     buffer = buf;
@@ -104,9 +105,10 @@ struct BiDirDelay {
     write_pos = 0;
     rev_phase = 0;
     prev_chunk_size = 0;
+    freeze_phase = 0;
   }
 
-  float Process(float in, float delay_knob, float feedback) {
+  float Process(float in, float delay_knob, float feedback, bool frozen) {
     float centered = (delay_knob - 0.5f) * 2.0f;
     bool reversed = centered < 0.0f;
     float delay_frac = std::abs(centered);
@@ -114,9 +116,12 @@ struct BiDirDelay {
         static_cast<size_t>(delay_frac * MAX_DELAY_SAMPLES);
 
     if (delay_samples < MIN_DELAY_SAMPLES) {
-      buffer[write_pos] = in;
-      write_pos = (write_pos + 1) % DELAY_BUF_SIZE;
+      if (!frozen) {
+        buffer[write_pos] = in;
+        write_pos = (write_pos + 1) % DELAY_BUF_SIZE;
+      }
       rev_phase = 0;
+      freeze_phase = 0;
       return 0.0f;
     }
 
@@ -124,6 +129,41 @@ struct BiDirDelay {
       delay_samples = MAX_DELAY_SAMPLES;
 
     float out = 0.0f;
+
+    if (frozen) {
+      // Loop over the last delay_samples of buffer content
+      size_t base =
+          (write_pos + DELAY_BUF_SIZE - delay_samples) % DELAY_BUF_SIZE;
+      size_t read_pos;
+      if (!reversed) {
+        read_pos = (base + freeze_phase) % DELAY_BUF_SIZE;
+      } else {
+        read_pos =
+            (base + delay_samples - 1 - freeze_phase) % DELAY_BUF_SIZE;
+      }
+      out = buffer[read_pos];
+
+      // Crossfade end of loop into beginning for a seamless wrap
+      size_t fade_len = std::min(XFADE_SAMPLES, delay_samples / 2);
+      if (fade_len > 0 && freeze_phase >= delay_samples - fade_len) {
+        float alpha = static_cast<float>(delay_samples - 1 - freeze_phase) /
+                      static_cast<float>(fade_len);
+        size_t wrap_phase = freeze_phase - (delay_samples - fade_len);
+        size_t wrap_pos;
+        if (!reversed)
+          wrap_pos = (base + wrap_phase) % DELAY_BUF_SIZE;
+        else
+          wrap_pos =
+              (base + delay_samples - 1 - wrap_phase) % DELAY_BUF_SIZE;
+        out = out * alpha + buffer[wrap_pos] * (1.0f - alpha);
+      }
+
+      freeze_phase = (freeze_phase + 1) % delay_samples;
+      return out;
+    }
+
+    // Not frozen — normal processing
+    freeze_phase = 0;
 
     if (!reversed) {
       size_t read_pos =
@@ -274,8 +314,23 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
                    size_t size) {
   hw.ProcessAllControls();
 
-  // Footswitch 1: toggle modulation on/off
-  mod_active ^= hw.switches[Hothouse::FOOTSWITCH_1].RisingEdge();
+  // Footswitch 1: short press = toggle mod, hold = freeze delays
+  static constexpr float HOLD_THRESHOLD_MS = 300.0f;
+  static float fs1_hold_ms = 0.0f;
+  float block_ms =
+      1000.0f * static_cast<float>(size) / hw.AudioSampleRate();
+
+  if (hw.switches[Hothouse::FOOTSWITCH_1].Pressed())
+    fs1_hold_ms += block_ms;
+
+  bool freeze = hw.switches[Hothouse::FOOTSWITCH_1].Pressed() &&
+                fs1_hold_ms > HOLD_THRESHOLD_MS;
+
+  if (hw.switches[Hothouse::FOOTSWITCH_1].FallingEdge()) {
+    if (fs1_hold_ms <= HOLD_THRESHOLD_MS)
+      mod_active = !mod_active;
+    fs1_hold_ms = 0.0f;
+  }
 
   // Footswitch 2: toggle effect bypass
   effect_active ^= hw.switches[Hothouse::FOOTSWITCH_2].RisingEdge();
@@ -416,7 +471,7 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
       if (mod_active)
         dt = std::clamp(dt + lfo_val[j + 1] * lfo.depth[j + 1] * 0.5f,
                         0.0f, 1.0f);
-      d_out[j] = delays[j].Process(mixed, dt, dly.fb[j]);
+      d_out[j] = delays[j].Process(mixed, dt, dly.fb[j], freeze);
     }
 
     float pre_verb = mixed;
