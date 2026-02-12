@@ -98,7 +98,7 @@ Three sine-wave LFOs in vertical pairs (rate on top row, depth on bottom row):
 | SWITCH 2 | BANK SELECT (row) | Combined with Switch 3 — see bank table above |
 | SWITCH 3 | BANK SELECT (col) | Combined with Switch 2 — see bank table above |
 | FOOTSWITCH 1 | MOD ON/OFF | Short press toggles LFO modulation. LED 1 lights when active. Long press (2s) = bootloader mode |
-| FOOTSWITCH 2 | Unused | |
+| FOOTSWITCH 2 | BYPASS | Short press toggles effect on/off. LED 2 lights when active (effect engaged). |
 
 ## Tips
 

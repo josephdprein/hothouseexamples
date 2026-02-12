@@ -187,6 +187,10 @@ Oscillator lfos[NUM_LFOS];
 bool mod_active = false;
 Led led_mod;
 
+// Effect bypass (footswitch 2)
+bool effect_active = true;
+Led led_bypass;
+
 // ----- Latched parameter values (persist across bank switches) -----
 
 struct {
@@ -271,6 +275,16 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
 
   // Footswitch 1: toggle modulation on/off
   mod_active ^= hw.switches[Hothouse::FOOTSWITCH_1].RisingEdge();
+
+  // Footswitch 2: toggle effect bypass
+  effect_active ^= hw.switches[Hothouse::FOOTSWITCH_2].RisingEdge();
+
+  // When bypassed, pass dry input straight through
+  if (!effect_active) {
+    for (size_t i = 0; i < size; i++)
+      out[0][i] = out[1][i] = in[0][i];
+    return;
+  }
 
   // Bank selection via switch 2 + switch 3 combo
   Bank bank = GetBank();
@@ -505,12 +519,17 @@ int main() {
   // Modulation LED (LED 1 / left footswitch LED)
   led_mod.Init(hw.seed.GetPin(Hothouse::LED_1), false);
 
+  // Bypass LED (LED 2 / right footswitch LED)
+  led_bypass.Init(hw.seed.GetPin(Hothouse::LED_2), false);
+
   hw.StartAdc();
   hw.StartAudio(AudioCallback);
 
   while (true) {
     led_mod.Set(mod_active ? 1.0f : 0.0f);
     led_mod.Update();
+    led_bypass.Set(effect_active ? 1.0f : 0.0f);
+    led_bypass.Update();
 
     hw.DelayMs(10);
     hw.CheckResetToBootloader();
