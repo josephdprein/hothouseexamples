@@ -350,8 +350,20 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     fs1_hold_ms = 0.0f;
   }
 
-  // Footswitch 2: toggle effect bypass
-  effect_active ^= hw.switches[Hothouse::FOOTSWITCH_2].RisingEdge();
+  // Footswitch 2: short press = toggle bypass, hold = infinite sustain
+  static float fs2_hold_ms = 0.0f;
+
+  if (hw.switches[Hothouse::FOOTSWITCH_2].Pressed())
+    fs2_hold_ms += block_ms;
+
+  bool sustain_hold = hw.switches[Hothouse::FOOTSWITCH_2].Pressed() &&
+                      fs2_hold_ms > HOLD_THRESHOLD_MS;
+
+  if (hw.switches[Hothouse::FOOTSWITCH_2].FallingEdge()) {
+    if (fs2_hold_ms <= HOLD_THRESHOLD_MS)
+      effect_active = !effect_active;
+    fs2_hold_ms = 0.0f;
+  }
 
   // When bypassed, pass dry input + reverb tail (delays cut immediately)
   if (!effect_active) {
@@ -453,10 +465,10 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     // Track input envelope
     float env_level = (*input_env)(abs_input);
 
-    // Gate detection with hysteresis
+    // Gate detection with hysteresis (sustain_hold prevents gate close)
     if (!gate_open && env_level > onset_thresh) {
       gate_open = true;
-    } else if (gate_open && env_level < release_thresh) {
+    } else if (gate_open && env_level < release_thresh && !sustain_hold) {
       gate_open = false;
     }
 
