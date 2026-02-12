@@ -315,7 +315,7 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
   hw.ProcessAllControls();
 
   // Footswitch 1: short press = toggle mod, hold = freeze delays
-  static constexpr float HOLD_THRESHOLD_MS = 300.0f;
+  static constexpr float HOLD_THRESHOLD_MS = 150.0f;
   static float fs1_hold_ms = 0.0f;
   float block_ms =
       1000.0f * static_cast<float>(size) / hw.AudioSampleRate();
