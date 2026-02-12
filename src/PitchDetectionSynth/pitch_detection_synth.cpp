@@ -437,6 +437,15 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
   float last_lfo_val[NUM_LFOS] = {};
   float block_peak = 0.0f;
 
+  // Switch 2 middle: LFO 1 modulates pitch instead of filter
+  bool lfo1_pitch_mod =
+      hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_2) ==
+      Hothouse::TOGGLESWITCH_MIDDLE;
+  // Switch 3 middle: LFO 1 resets phase on trigger
+  bool lfo1_trig_sync =
+      hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_3) ==
+      Hothouse::TOGGLESWITCH_MIDDLE;
+
   for (size_t i = 0; i < size; ++i) {
     float input = in[0][i];
     float abs_input = std::abs(input);
@@ -450,6 +459,12 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     } else if (gate_open && env_level < release_thresh) {
       gate_open = false;
     }
+
+    // LFO 1 trigger sync: reset phase on gate rising edge
+    static bool prev_gate = false;
+    if (lfo1_trig_sync && gate_open && !prev_gate)
+      lfos[0].Reset();
+    prev_gate = gate_open;
 
     // Pitch detection
     (*pd)(input);
@@ -470,13 +485,18 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
     for (int j = 0; j < NUM_LFOS; j++)
       last_lfo_val[j] = lfo_val[j];
 
-    // Filter cutoff: envelope modulation + optional LFO 1
+    // Filter cutoff: envelope modulation + optional LFO 1 (filter mode)
     float cutoff_mod = synth.cutoff * env_out;
-    if (mod_active) {
+    if (mod_active && !lfo1_pitch_mod) {
       cutoff_mod *= (1.0f + lfo_val[0] * lfo.depth[0]);
     }
     flt.SetFreq(std::max(cutoff_mod, 20.0f));
     flt.SetRes(synth.res);
+
+    // LFO 1 pitch modulation (switch 2 middle)
+    if (mod_active && lfo1_pitch_mod && detected_freq > 0.0f) {
+      osc.SetFreq(detected_freq * (1.0f + lfo_val[0] * lfo.depth[0]));
+    }
 
     // Synth output
     float synth_out = flt.Process(osc.Process()) * env_out;
