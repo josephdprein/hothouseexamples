@@ -16,12 +16,12 @@ A pitch-tracking monophonic synthesizer with dual bidirectional delay lines and 
 
 ## Controls
 
-Four knob banks are selected by the combination of Toggle Switches 2 and 3. When you switch banks, the other banks' parameters hold their last values.
+Four knob banks are selected by the combination of Toggle Switches 2 and 3. When you switch banks, the other banks' parameters hold their last values. **Knob pickup** prevents parameter jumps: after switching banks, each knob must be physically moved before it updates its value.
 
 | SW 2 | SW 3 | Bank |
 |------|------|------|
 | UP | UP | **A** — Synth |
-| DOWN | UP | **B** — Detection/Mix |
+| DOWN | UP | **B** — Detection/Mix/Reverb |
 | UP | DOWN | **C** — Delays |
 | DOWN | DOWN | **D** — LFOs |
 
@@ -38,13 +38,16 @@ MIDDLE position on either switch is treated the same as UP.
 | KNOB 5 | SUSTAIN | ADSR sustain level, 0.0 to 1.0 |
 | KNOB 6 | RELEASE | ADSR release time, 0.05 to 2 sec |
 
-### Bank B — Detection/Mix (SW2 DOWN, SW3 UP)
+### Bank B — Detection/Mix/Reverb (SW2 DOWN, SW3 UP)
 
 | CONTROL | DESCRIPTION | NOTES |
 |-|-|-|
 | KNOB 1 | SENSITIVITY | Onset detection threshold. Lower = more sensitive, higher = rejects noise. Range 0.001 to 0.1 |
 | KNOB 2 | DRY/WET | 0.0 = input only, 1.0 = synth only. Defaults to full wet |
-| KNOB 3–6 | Unused | |
+| KNOB 3 | REVERB SEND | How much signal is sent to the reverb, 0.0–1.0. Fully CCW = no reverb |
+| KNOB 4 | REVERB DECAY | Reverb tail length (feedback), 0.3–0.999. Higher = longer decay |
+| KNOB 5 | REVERB TONE | Reverb low-pass filter, 500 Hz–16 kHz. Lower = darker reverb |
+| KNOB 6 | Unused | |
 
 ### Bank C — Delays (SW2 UP, SW3 DOWN)
 
@@ -109,6 +112,8 @@ Three sine-wave LFOs in vertical pairs (rate on top row, depth on bottom row):
 - LFO on the filter creates classic auto-wah and filter sweep effects
 - LFO on delay times creates chorus-like pitch modulation effects — try slow rates with subtle depth
 - All depth knobs at fully CCW = zero modulation, so you can set rates first then bring in depth to taste
+- The reverb adds space to the overall signal (post-delays). Keep the send moderate to avoid wash-out, or crank it for ambient pads
+- After switching banks, wiggle each knob slightly before expecting it to respond — this is the **knob pickup** preventing accidental jumps
 
 ## Signal Flow
 
@@ -124,6 +129,9 @@ Guitar In → Pitch Detect + Envelope Follow
            ┌─── Delay 1 (fwd/rev) ←── LFO 2 (when mod active) ───┐
            ├─── Delay 2 (fwd/rev) ←── LFO 3 (when mod active) ───┤
            └─── Dry signal ───────────────────────────────────────┘
+                            ↓ (summed)
+                       ┌─── Reverb (send/return) ───┐
+                       └─── Dry ────────────────────┘
                             ↓ (summed)
                        Stereo Output
 ```
