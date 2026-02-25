@@ -31,7 +31,7 @@
 //
 // Speed knob mapping:
 //   Fully CCW   = half speed (0.5x)
-//   Noon ±10%   = frozen (sample-and-hold)
+//   Noon ±5%    = frozen (sample-and-hold)
 //   ~3 o'clock  = unity speed (1×) with ±5% grace zone
 //   Fully CW    = double speed (2x)
 //
@@ -63,9 +63,9 @@ Hothouse hw;
 float DSY_SDRAM_BSS loop_buf_1[MAX_LOOP_SAMPLES];
 float DSY_SDRAM_BSS loop_buf_2[MAX_LOOP_SAMPLES];
 
-// Frozen-zone boundaries: noon (0.5) ± 10% of total travel
-static constexpr float FREEZE_LO = 0.40f;
-static constexpr float FREEZE_HI = 0.60f;
+// Frozen-zone boundaries: noon (0.5) ± 5% of total travel
+static constexpr float FREEZE_LO = 0.45f;
+static constexpr float FREEZE_HI = 0.55f;
 
 // Unity-speed (1×) grace zone: ±5% of total travel around the 1× point
 static constexpr float UNITY_LO = 0.75f;
