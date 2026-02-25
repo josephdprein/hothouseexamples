@@ -6,10 +6,18 @@
 // --------                          --------
 // Knob 1: Speed                     Knob 4: Speed
 // Knob 2: Level                     Knob 5: Level
-// Knob 3: Warble                    Knob 6: Warble
+// Knob 3: Warble depth              Knob 6: Warble depth
 // Switch 1 UP:   Semitone snap      Switch 2 UP:   Semitone snap
 // Switch 1 DOWN: Reverse            Switch 2 DOWN: Reverse
 // Footswitch 1:  Record/Stop        Footswitch 2:  Record/Stop
+//
+// Switch 3: Global warble intensity for both loopers
+//   UP   = intense warble
+//   MID  = no warble
+//   DOWN = subtle warble
+//
+// Warble uses filtered random noise (slow drift + fast flutter)
+// for an organic, tape-like wobble rather than periodic modulation.
 //
 // Speed knob mapping:
 //   Fully CCW  = half speed (0.5x)
@@ -80,6 +88,17 @@ static float KnobToSpeed(float knob, bool semitone_snap) {
   return speed;
 }
 
+// Simple pseudo-random noise via LCG, returns -1 … +1
+static float RandFloat(uint32_t &state) {
+  state = state * 1664525u + 1013904223u;
+  return static_cast<float>(static_cast<int32_t>(state)) / 2147483648.0f;
+}
+
+// One-pole lowpass coefficient from cutoff frequency
+static inline float OnePoleCoeff(float freq_hz) {
+  return 1.0f - expf(-TWO_PI * freq_hz / SAMPLE_RATE_F);
+}
+
 struct Looper {
   float *buffer;
   size_t loop_length;  // recorded length in samples
@@ -96,11 +115,14 @@ struct Looper {
   bool reverse;
   bool semitone_snap;
 
-  // Warble LFO (two components for a richer wow-flutter)
-  float lfo_phase_slow;
-  float lfo_phase_fast;
+  // Random warble state — two filtered noise bands per looper
+  // so each looper drifts independently
+  uint32_t rng_state;
+  float noise_slow;     // filtered at ~1 Hz  — slow wow drift
+  float noise_mid;      // filtered at ~4 Hz  — medium wander
+  float noise_fast;     // filtered at ~12 Hz — fast flutter
 
-  void Init(float *buf) {
+  void Init(float *buf, uint32_t seed) {
     buffer = buf;
     loop_length = 0;
     read_pos = 0.0f;
@@ -112,8 +134,10 @@ struct Looper {
     warble_depth = 0.0f;
     reverse = false;
     semitone_snap = false;
-    lfo_phase_slow = 0.0f;
-    lfo_phase_fast = 0.0f;
+    rng_state = seed;
+    noise_slow = 0.0f;
+    noise_mid = 0.0f;
+    noise_fast = 0.0f;
   }
 
   void ToggleRecord() {
@@ -145,18 +169,25 @@ struct Looper {
       return 0.0f;
     }
 
-    // --- Warble LFO -------------------------------------------------
+    // --- Random warble ----------------------------------------------
     float effective_speed = speed;
     if (warble_depth > 0.001f && speed > 0.001f) {
-      // Slow wow (~1.5 Hz) + faster flutter (~6 Hz)
-      lfo_phase_slow += 1.5f / SAMPLE_RATE_F;
-      if (lfo_phase_slow >= 1.0f) lfo_phase_slow -= 1.0f;
-      lfo_phase_fast += 6.0f / SAMPLE_RATE_F;
-      if (lfo_phase_fast >= 1.0f) lfo_phase_fast -= 1.0f;
+      // Three filtered noise bands for organic, non-repeating wobble:
+      //   slow (~1 Hz)  — broad pitch drift
+      //   mid  (~4 Hz)  — irregular wander
+      //   fast (~12 Hz) — subtle flutter / grit
+      float raw = RandFloat(rng_state);
+      noise_slow += OnePoleCoeff(1.0f) * (raw - noise_slow);
+      raw = RandFloat(rng_state);
+      noise_mid += OnePoleCoeff(4.0f) * (raw - noise_mid);
+      raw = RandFloat(rng_state);
+      noise_fast += OnePoleCoeff(12.0f) * (raw - noise_fast);
 
-      float lfo = 0.7f * sinf(lfo_phase_slow * TWO_PI) +
-                  0.3f * sinf(lfo_phase_fast * TWO_PI);
-      effective_speed = speed * (1.0f + warble_depth * 0.3f * lfo);
+      float wobble = 0.55f * noise_slow +
+                     0.30f * noise_mid +
+                     0.15f * noise_fast;
+
+      effective_speed = speed * (1.0f + warble_depth * wobble);
       if (effective_speed < 0.0f) effective_speed = 0.0f;
     }
 
@@ -196,6 +227,18 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
                    size_t size) {
   hw.ProcessAllControls();
 
+  // ---- Switch 3: global warble intensity for both loopers ----------
+  //   UP   = intense (knob scales 0–0.5)
+  //   MID  = none    (warble off regardless of knob)
+  //   DOWN = subtle  (knob scales 0–0.15)
+  float warble_scale = 0.0f;
+  auto sw3 = hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_3);
+  if (sw3 == Hothouse::TOGGLESWITCH_UP) {
+    warble_scale = 0.5f;   // intense
+  } else if (sw3 == Hothouse::TOGGLESWITCH_DOWN) {
+    warble_scale = 0.15f;  // subtle
+  }
+
   // ---- Looper 1 controls (knobs 1-3, switch 1, footswitch 1) ------
   float k1 = hw.GetKnobValue(Hothouse::KNOB_1);
   float k2 = hw.GetKnobValue(Hothouse::KNOB_2);
@@ -207,7 +250,7 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
 
   looper1.speed = KnobToSpeed(k1, looper1.semitone_snap);
   looper1.level = k2;
-  looper1.warble_depth = k3;
+  looper1.warble_depth = k3 * warble_scale;
 
   if (hw.switches[Hothouse::FOOTSWITCH_1].RisingEdge()) {
     looper1.ToggleRecord();
@@ -224,7 +267,7 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
 
   looper2.speed = KnobToSpeed(k4, looper2.semitone_snap);
   looper2.level = k5;
-  looper2.warble_depth = k6;
+  looper2.warble_depth = k6 * warble_scale;
 
   if (hw.switches[Hothouse::FOOTSWITCH_2].RisingEdge()) {
     looper2.ToggleRecord();
@@ -247,8 +290,8 @@ int main() {
   hw.SetAudioBlockSize(4);
   hw.SetAudioSampleRate(SaiHandle::Config::SampleRate::SAI_48KHZ);
 
-  looper1.Init(loop_buf_1);
-  looper2.Init(loop_buf_2);
+  looper1.Init(loop_buf_1, 0xDEADBEEF);
+  looper2.Init(loop_buf_2, 0x8BADF00D);
 
   led1.Init(hw.seed.GetPin(Hothouse::LED_1), false);
   led2.Init(hw.seed.GetPin(Hothouse::LED_2), false);
