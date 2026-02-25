@@ -24,9 +24,12 @@
 //   e) Has loop, not playing   → start playing from beginning
 //
 // Footswitch (hold ≥1 s):
-//   a) Recording, no loop → cancel recording (LED blinks 1×)
-//   b) Playing            → stop playback (LED blinks 1×)
-//   c) Stopped, has loop  → erase loop (LED blinks 3×)
+//   a) Playing            → stop playback (LED blinks 1×)
+//   b) Stopped, has loop  → toggle loop ↔ one-shot mode (1× = one-shot, 2× = loop)
+//   c) Recording, no loop → cancel recording (LED blinks 1×)
+//
+// Footswitch (hold ≥2 s, starting from stopped):
+//   a) Stopped, has loop  → erase loop (LED blinks 3×)
 //
 // Speed knob mapping:
 //   Fully CCW   = frozen (sample-and-hold, 0×)
@@ -72,8 +75,9 @@ static constexpr float UNITY_HI = 0.55f;
 static constexpr float TWO_PI = 6.283185307f;
 static constexpr float SAMPLE_RATE_F = 48000.f;
 
-// Hold threshold for long-press detection (ms)
-static constexpr uint32_t HOLD_MS = 1000;
+// Hold thresholds
+static constexpr uint32_t MODE_MS  = 1000;  // stop (if playing) or toggle loop/one-shot (if stopped)
+static constexpr uint32_t ERASE_MS = 2000;  // erase (if hold started while stopped)
 
 // ---------------------------------------------------------------------------
 // Speed knob → playback rate
@@ -136,6 +140,7 @@ struct Looper {
   bool recording;
   bool has_loop;
   bool playing;
+  bool loop_mode;  // true = loop continuously, false = one-shot
 
   // Knob / switch parameters
   float speed;
@@ -161,6 +166,7 @@ struct Looper {
     recording = false;
     has_loop = false;
     playing = false;
+    loop_mode = true;
     speed = 0.0f;
     level = 1.0f;
     warble_depth = 0.0f;
@@ -205,23 +211,36 @@ struct Looper {
     }
   }
 
-  void LongPress() {
+  // 1-second hold action
+  void ModePress() {
     if (playing) {
-      // Stop playback and any overdub
+      // Stop playback and any active overdub
       playing = false;
       recording = false;
       led_blink_count = 1;
-    } else if (has_loop || recording) {
-      // Erase loop or cancel recording
+    } else if (has_loop) {
+      // Toggle loop ↔ one-shot; blink count confirms new mode
+      loop_mode = !loop_mode;
+      led_blink_count = loop_mode ? 2 : 1;  // 2× = loop, 1× = one-shot
+    } else if (recording) {
+      // Cancel recording in progress (no loop yet)
+      recording = false;
+      led_blink_count = 1;
+    }
+    // else: idle, nothing to do
+  }
+
+  // 2-second hold action (only fires when hold started from stopped state)
+  void ErasePress() {
+    if (!playing && (has_loop || recording)) {
       bool was_loop = has_loop;
       has_loop = false;
       recording = false;
       loop_length = 0;
       rec_pos = 0;
       read_pos = 0.0f;
-      led_blink_count = was_loop ? 3 : 1;  // 3× erase, 1× cancel
+      led_blink_count = was_loop ? 3 : 1;
     }
-    // else: idle, nothing to do
   }
 
   // --- Per-sample audio --------------------------------------------------
@@ -281,12 +300,23 @@ struct Looper {
 
     // --- Advance playback head --------------------------------------------
     if (effective_speed > 0.001f) {
+      float prev_pos = read_pos;
       if (reverse) {
         read_pos -= effective_speed;
         if (read_pos < 0.0f) read_pos += flen;
       } else {
         read_pos += effective_speed;
         if (read_pos >= flen) read_pos -= flen;
+      }
+
+      // One-shot: stop automatically when the head wraps past the boundary
+      if (!loop_mode) {
+        bool wrapped = reverse ? (read_pos > prev_pos) : (read_pos < prev_pos);
+        if (wrapped) {
+          playing = false;
+          recording = false;
+          read_pos = 0.0f;
+        }
       }
     }
 
@@ -295,26 +325,40 @@ struct Looper {
 };
 
 // ---------------------------------------------------------------------------
-// Footswitch hold-detection (fires NormalPress on release, LongPress on hold)
+// Footswitch hold-detection
+//   Release before MODE_MS  → NormalPress
+//   Hold ≥ MODE_MS          → ModePress (stop if playing; toggle mode if stopped)
+//   Hold ≥ ERASE_MS         → ErasePress (only fires if hold started while stopped)
 // ---------------------------------------------------------------------------
 struct FootswitchTracker {
   bool prev_pressed;
-  bool long_triggered;
+  bool mode_triggered;
+  bool erase_triggered;
+  bool started_stopped;  // true when the hold began from a stopped state
   uint32_t press_start;
 
   void Process(bool pressed, Looper &looper) {
     if (pressed && !prev_pressed) {
       press_start = System::GetNow();
-      long_triggered = false;
+      mode_triggered = false;
+      erase_triggered = false;
+      started_stopped = looper.has_loop && !looper.playing;
     }
 
-    if (pressed && !long_triggered &&
-        (System::GetNow() - press_start) >= HOLD_MS) {
-      looper.LongPress();
-      long_triggered = true;
+    uint32_t held_ms = System::GetNow() - press_start;
+
+    if (pressed && !mode_triggered && held_ms >= MODE_MS) {
+      looper.ModePress();
+      mode_triggered = true;
     }
 
-    if (!pressed && prev_pressed && !long_triggered) {
+    if (pressed && mode_triggered && !erase_triggered &&
+        started_stopped && held_ms >= ERASE_MS) {
+      looper.ErasePress();
+      erase_triggered = true;
+    }
+
+    if (!pressed && prev_pressed && !mode_triggered) {
       looper.NormalPress();
     }
 
@@ -326,8 +370,8 @@ struct FootswitchTracker {
 // Globals
 // ---------------------------------------------------------------------------
 Looper looper1, looper2;
-FootswitchTracker fs1 = {false, false, 0};
-FootswitchTracker fs2 = {false, false, 0};
+FootswitchTracker fs1 = {false, false, false, false, 0};
+FootswitchTracker fs2 = {false, false, false, false, 0};
 Led led1, led2;
 
 // ---------------------------------------------------------------------------

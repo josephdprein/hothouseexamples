@@ -2,7 +2,7 @@
 
 ## Description
 
-Two fully independent loop samplers with variable-speed playback, re-overdub, semitone quantization, reverse, and random warble modulation. Each looper can capture up to 60 seconds of audio and play it back at speeds from near-zero to double, with a freeze mode that holds a single sample. The warble engine uses filtered random noise (not a periodic LFO) for organic, tape-like pitch drift. Switch 3 sets the signal routing between the two loopers, enabling series chaining for cascaded processing.
+Two fully independent loop samplers with variable-speed playback, re-overdub, semitone quantization, reverse, and random warble modulation. Each looper can capture up to 60 seconds of audio and play it back at speeds from near-zero to double, with a freeze mode that holds a single sample. Playback can loop continuously or fire as a one-shot (plays once, then stops). The warble engine uses filtered random noise (not a periodic LFO) for organic, tape-like pitch drift. Switch 3 sets the signal routing between the two loopers, enabling series chaining for cascaded processing.
 
 ## Controls
 
@@ -59,8 +59,16 @@ Each footswitch controls its respective looper. Short press and hold (≥1 secon
 | STATE | ACTION | LED FEEDBACK |
 |-|-|-|
 | Playing (with or without overdub) | Stop playback | 1 blink |
-| Stopped (has loop) | Erase loop | 3 blinks |
+| Stopped (has loop) | Toggle loop ↔ one-shot mode | 1 blink = one-shot, 2 blinks = loop |
 | Recording (no loop) | Cancel recording | 1 blink |
+
+#### Hold (≥2 seconds, starting from stopped)
+
+| STATE | ACTION | LED FEEDBACK |
+|-|-|-|
+| Stopped (has loop) | Erase loop | 3 blinks |
+
+Keep holding past the 1-second mode toggle to reach the 2-second erase. The 1-second blink fires as confirmation that mode toggled; keep holding and the erase fires at 2 seconds.
 
 ### LEDs
 
@@ -71,6 +79,13 @@ Each footswitch controls its respective looper. Short press and hold (≥1 secon
 | Slow pulse (~2.5 Hz) | Overdubbing — adding layers to an existing loop |
 | Solid | Loop is playing |
 | Feedback blinks (1× or 3×) | Confirmation after a hold action |
+
+## Playback Modes
+
+- **Loop mode** (default): Playback repeats continuously. Short press while playing toggles overdub.
+- **One-shot mode**: Playback runs once from beginning to end, then stops automatically. Short press while stopped re-triggers from the start.
+
+Toggle between modes by holding the footswitch for 1 second while the loop is stopped (not playing). The LED confirms the new mode: **2 blinks = loop**, **1 blink = one-shot**. Keep holding past 1 second to erase (3 blinks at 2 seconds).
 
 ## Warble
 
