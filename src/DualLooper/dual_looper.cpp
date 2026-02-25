@@ -203,13 +203,17 @@ struct Looper {
 
   void LongPress() {
     if (!playing) {
-      // (a) Erase — clear everything
+      if (!has_loop && !recording) {
+        return;  // nothing to erase or cancel — ignore
+      }
+      bool was_loop = has_loop;
+      // (a) Erase / cancel — clear everything
       has_loop = false;
       recording = false;
       loop_length = 0;
       rec_pos = 0;
       read_pos = 0.0f;
-      led_blink_count = 3;
+      led_blink_count = was_loop ? 3 : 1;  // 3× erase, 1× cancel
     } else {
       // (b) Stop playback, stop any overdub, toggle mode
       playing = false;
@@ -234,12 +238,6 @@ struct Looper {
       return 0.0f;
     }
 
-    // Overdub: mix input into buffer at current playback position
-    if (recording && playing) {
-      size_t wr = static_cast<size_t>(read_pos) % loop_length;
-      buffer[wr] = daisysp::SoftClip(buffer[wr] + in);
-    }
-
     if (!playing) {
       return 0.0f;
     }
@@ -259,6 +257,14 @@ struct Looper {
                      0.15f * noise_fast;
       effective_speed = speed * (1.0f + warble_depth * wobble);
       if (effective_speed < 0.0f) effective_speed = 0.0f;
+    }
+
+    // Overdub: mix input into buffer at current playback position.
+    // Only write when the head is actually moving so a frozen loop
+    // doesn't saturate a single sample.
+    if (recording && effective_speed > 0.001f) {
+      size_t wr = static_cast<size_t>(read_pos) % loop_length;
+      buffer[wr] = daisysp::SoftClip(buffer[wr] + in);
     }
 
     // --- Read with linear interpolation -----------------------------------
