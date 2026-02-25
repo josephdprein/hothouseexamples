@@ -6,36 +6,35 @@
 // --------                          --------
 // Knob 1: Speed                     Knob 4: Speed
 // Knob 2: Level                     Knob 5: Level
-// Knob 3: Warble depth              Knob 6: Warble depth
+// Knob 3: Warble                    Knob 6: Warble
 // Switch 1 UP:   Semitone snap      Switch 2 UP:   Semitone snap
 // Switch 1 DOWN: Reverse            Switch 2 DOWN: Reverse
 // Footswitch 1:  See below          Footswitch 2:  See below
 //
-// Switch 3: Global warble intensity for both loopers
-//   UP   = intense warble
-//   MID  = no warble
-//   DOWN = subtle warble
+// Switch 3: Signal routing
+//   UP   = Looper 1 output feeds Looper 2 input (series: L1 → L2)
+//   MID  = Both loopers record dry input independently (parallel)
+//   DOWN = Looper 2 output feeds Looper 1 input (series: L2 → L1)
 //
 // Footswitch (short press):
 //   a) No loop, not recording  → start recording
-//   b) No loop, recording      → set loop end, begin playing, keep recording
-//                                 (overdub)
-//   c) Has loop, recording     → stop overdubbing
-//   d) Has loop, not recording → loop mode: toggle play/stop
-//                                 one-shot mode: trigger from beginning
+//   b) No loop, recording      → set loop end, begin playing (clean)
+//   c) Has loop, playing, not overdubbing → start overdub
+//   d) Has loop, playing, overdubbing     → stop overdub
+//   e) Has loop, not playing   → start playing from beginning
 //
 // Footswitch (hold ≥1 s):
-//   a) Not playing → erase loop (LED blinks 3×)
-//   b) Playing     → stop, toggle between one-shot (1 blink) /
-//                     loop mode (2 blinks)
+//   a) Recording, no loop → cancel recording (LED blinks 1×)
+//   b) Playing            → stop playback (LED blinks 1×)
+//   c) Stopped, has loop  → erase loop (LED blinks 3×)
 //
 // Speed knob mapping:
-//   Fully CCW   = half speed (0.5x)
-//   Noon ±5%    = frozen (sample-and-hold)
-//   ~3 o'clock  = unity speed (1×) with ±5% grace zone
-//   Fully CW    = double speed (2x)
+//   Fully CCW   = frozen (sample-and-hold, 0×)
+//   Noon ±5%    = unity speed (1×) grace zone
+//   Fully CW    = double speed (2×)
 //
-// LED: blinks while recording/overdubbing, solid while playing, off otherwise.
+// LED: fast blink while recording, slow pulse while overdubbing,
+//      solid while playing, off otherwise.
 // Feedback blinks temporarily override normal LED state.
 //
 // This program is free software: you can redistribute it and/or modify
@@ -63,13 +62,12 @@ Hothouse hw;
 float DSY_SDRAM_BSS loop_buf_1[MAX_LOOP_SAMPLES];
 float DSY_SDRAM_BSS loop_buf_2[MAX_LOOP_SAMPLES];
 
-// Frozen-zone boundaries: noon (0.5) ± 5% of total travel
-static constexpr float FREEZE_LO = 0.45f;
-static constexpr float FREEZE_HI = 0.55f;
+// Frozen zone: CCW extreme → FREEZE_HI (5% of travel)
+static constexpr float FREEZE_HI = 0.05f;
 
-// Unity-speed (1×) grace zone: ±5% of total travel around the 1× point
-static constexpr float UNITY_LO = 0.75f;
-static constexpr float UNITY_HI = 0.85f;
+// Unity-speed (1×) grace zone: ±5% around noon (center of travel)
+static constexpr float UNITY_LO = 0.45f;
+static constexpr float UNITY_HI = 0.55f;
 
 static constexpr float TWO_PI = 6.283185307f;
 static constexpr float SAMPLE_RATE_F = 48000.f;
@@ -79,24 +77,26 @@ static constexpr uint32_t HOLD_MS = 1000;
 
 // ---------------------------------------------------------------------------
 // Speed knob → playback rate
+//
+// Zone layout (knob 0.0 = fully CCW, 1.0 = fully CW):
+//   0.00 – 0.05 : frozen (0×)          — CCW extreme
+//   0.05 – 0.45 : 0× → 1×             — slow ramp (0.5× lands ~25%)
+//   0.45 – 0.55 : 1× grace zone        — noon ±5%
+//   0.55 – 1.00 : 1× → 2×             — fast ramp
 // ---------------------------------------------------------------------------
 static float KnobToSpeed(float knob, bool semitone_snap) {
   float speed;
 
-  if (knob <= FREEZE_LO) {
-    // 0.0 → 0.5x,  FREEZE_LO → 0x
-    float t = knob / FREEZE_LO;
-    speed = 0.5f * (1.0f - t);
-  } else if (knob < FREEZE_HI) {
-    return 0.0f;  // frozen zone
+  if (knob < FREEZE_HI) {
+    return 0.0f;  // frozen zone — CCW extreme
   } else if (knob < UNITY_LO) {
-    // FREEZE_HI → 0x,  UNITY_LO → 1x
+    // Smooth ramp: 0× at FREEZE_HI, 1× at UNITY_LO
     float t = (knob - FREEZE_HI) / (UNITY_LO - FREEZE_HI);
     speed = t;
   } else if (knob <= UNITY_HI) {
-    speed = 1.0f;  // 1× grace zone
+    speed = 1.0f;  // unity grace zone — noon ±5%
   } else {
-    // UNITY_HI → 1x,  1.0 → 2x
+    // UNITY_HI → 1×,  1.0 → 2×
     float t = (knob - UNITY_HI) / (1.0f - UNITY_HI);
     speed = 1.0f + t;
   }
@@ -136,7 +136,6 @@ struct Looper {
   bool recording;
   bool has_loop;
   bool playing;
-  bool loop_mode;  // true = continuous loop, false = one-shot
 
   // Knob / switch parameters
   float speed;
@@ -162,7 +161,6 @@ struct Looper {
     recording = false;
     has_loop = false;
     playing = false;
-    loop_mode = true;
     speed = 0.0f;
     level = 1.0f;
     warble_depth = 0.0f;
@@ -179,61 +177,51 @@ struct Looper {
 
   void NormalPress() {
     if (!has_loop && !recording) {
-      // (a) Start recording
+      // (a) Idle → start recording
       recording = true;
       rec_pos = 0;
       loop_length = 0;
     } else if (!has_loop && recording) {
-      // (b) Set loop end, begin playing, keep recording (overdub)
+      // (b) Set loop end, start playing clean (no auto-overdub)
       loop_length = rec_pos;
       has_loop = (loop_length > 1);
       if (has_loop) {
         playing = true;
+        recording = false;
         read_pos = 0.0f;
-        // recording stays true → overdub
       } else {
         recording = false;  // too short, cancel
       }
-    } else if (has_loop && recording) {
-      // (c) Stop overdubbing
+    } else if (has_loop && playing && !recording) {
+      // (c) Playing → start overdub
+      recording = true;
+    } else if (has_loop && playing && recording) {
+      // (d) Overdubbing → stop overdub, keep playing
       recording = false;
-    } else if (has_loop && !recording) {
-      // (d) Mode-dependent playback
-      if (loop_mode) {
-        if (playing) {
-          playing = false;
-        } else {
-          read_pos = 0.0f;
-          playing = true;
-        }
-      } else {
-        // One-shot: always trigger from beginning
-        read_pos = 0.0f;
-        playing = true;
-      }
+    } else if (has_loop && !playing) {
+      // (e) Stopped → start playing from beginning
+      read_pos = 0.0f;
+      playing = true;
     }
   }
 
   void LongPress() {
-    if (!playing) {
-      if (!has_loop && !recording) {
-        return;  // nothing to erase or cancel — ignore
-      }
+    if (playing) {
+      // Stop playback and any overdub
+      playing = false;
+      recording = false;
+      led_blink_count = 1;
+    } else if (has_loop || recording) {
+      // Erase loop or cancel recording
       bool was_loop = has_loop;
-      // (a) Erase / cancel — clear everything
       has_loop = false;
       recording = false;
       loop_length = 0;
       rec_pos = 0;
       read_pos = 0.0f;
       led_blink_count = was_loop ? 3 : 1;  // 3× erase, 1× cancel
-    } else {
-      // (b) Stop playback, stop any overdub, toggle mode
-      playing = false;
-      recording = false;
-      loop_mode = !loop_mode;
-      led_blink_count = loop_mode ? 2 : 1;
     }
+    // else: idle, nothing to do
   }
 
   // --- Per-sample audio --------------------------------------------------
@@ -293,23 +281,12 @@ struct Looper {
 
     // --- Advance playback head --------------------------------------------
     if (effective_speed > 0.001f) {
-      float prev_pos = read_pos;
       if (reverse) {
         read_pos -= effective_speed;
         if (read_pos < 0.0f) read_pos += flen;
       } else {
         read_pos += effective_speed;
         if (read_pos >= flen) read_pos -= flen;
-      }
-
-      // One-shot: stop when the head wraps past the loop boundary
-      if (!loop_mode) {
-        bool wrapped = reverse ? (read_pos > prev_pos) : (read_pos < prev_pos);
-        if (wrapped) {
-          playing = false;
-          recording = false;
-          read_pos = 0.0f;
-        }
       }
     }
 
@@ -364,14 +341,10 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
   fs1.Process(hw.switches[Hothouse::FOOTSWITCH_1].Pressed(), looper1);
   fs2.Process(hw.switches[Hothouse::FOOTSWITCH_2].Pressed(), looper2);
 
-  // ---- Switch 3: global warble intensity -------------------------------
-  float warble_scale = 0.0f;
+  // ---- Switch 3: signal routing ----------------------------------------
   auto sw3 = hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_3);
-  if (sw3 == Hothouse::TOGGLESWITCH_UP) {
-    warble_scale = 0.5f;
-  } else if (sw3 == Hothouse::TOGGLESWITCH_DOWN) {
-    warble_scale = 0.15f;
-  }
+  bool route_l1_to_l2 = (sw3 == Hothouse::TOGGLESWITCH_UP);
+  bool route_l2_to_l1 = (sw3 == Hothouse::TOGGLESWITCH_DOWN);
 
   // ---- Looper 1 knobs / switches --------------------------------------
   float k1 = hw.GetKnobValue(Hothouse::KNOB_1);
@@ -383,7 +356,7 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
   looper1.reverse = (sw1 == Hothouse::TOGGLESWITCH_DOWN);
   looper1.speed = KnobToSpeed(k1, looper1.semitone_snap);
   looper1.level = k2;
-  looper1.warble_depth = k3 * warble_scale;
+  looper1.warble_depth = k3;
 
   // ---- Looper 2 knobs / switches --------------------------------------
   float k4 = hw.GetKnobValue(Hothouse::KNOB_4);
@@ -395,13 +368,27 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
   looper2.reverse = (sw2 == Hothouse::TOGGLESWITCH_DOWN);
   looper2.speed = KnobToSpeed(k4, looper2.semitone_snap);
   looper2.level = k5;
-  looper2.warble_depth = k6 * warble_scale;
+  looper2.warble_depth = k6;
 
   // ---- Per-sample processing -------------------------------------------
   for (size_t i = 0; i < size; ++i) {
     float dry = in[0][i];
-    float wet1 = looper1.Process(dry);
-    float wet2 = looper2.Process(dry);
+    float wet1, wet2;
+
+    if (route_l1_to_l2) {
+      // Series: L1 records dry; L2 records L1's loop output
+      wet1 = looper1.Process(dry);
+      wet2 = looper2.Process(wet1);
+    } else if (route_l2_to_l1) {
+      // Series: L2 records dry; L1 records L2's loop output
+      wet2 = looper2.Process(dry);
+      wet1 = looper1.Process(wet2);
+    } else {
+      // Parallel: both loopers record dry independently
+      wet1 = looper1.Process(dry);
+      wet2 = looper2.Process(dry);
+    }
+
     out[0][i] = out[1][i] = daisysp::SoftClip(dry + wet1 + wet2);
   }
 }
@@ -428,9 +415,12 @@ static void UpdateLed(Led &led, Looper &looper,
     if (blink_timer >= blink_remaining * 16) {
       blink_remaining = 0;
     }
-  } else if (looper.recording) {
-    // Blink while recording / overdubbing (~5 Hz)
-    led.Set((tick % 10 < 5) ? 1.0f : 0.0f);
+  } else if (looper.recording && !looper.has_loop) {
+    // Initial recording: fast blink (~12 Hz) — "commit carefully, loop point next"
+    led.Set((tick % 4 < 2) ? 1.0f : 0.0f);
+  } else if (looper.recording && looper.has_loop) {
+    // Overdubbing: slow pulse (~2.5 Hz) — "adding layers, relaxed"
+    led.Set((tick % 20 < 10) ? 1.0f : 0.0f);
   } else {
     led.Set(looper.playing ? 1.0f : 0.0f);
   }
