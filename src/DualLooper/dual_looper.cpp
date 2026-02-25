@@ -30,9 +30,10 @@
 //                     loop mode (2 blinks)
 //
 // Speed knob mapping:
-//   Fully CCW  = half speed (0.5x)
-//   Noon ±10%  = frozen (sample-and-hold)
-//   Fully CW   = double speed (2x)
+//   Fully CCW   = half speed (0.5x)
+//   Noon ±10%   = frozen (sample-and-hold)
+//   ~3 o'clock  = unity speed (1×) with ±5% grace zone
+//   Fully CW    = double speed (2x)
 //
 // LED: blinks while recording/overdubbing, solid while playing, off otherwise.
 // Feedback blinks temporarily override normal LED state.
@@ -66,6 +67,10 @@ float DSY_SDRAM_BSS loop_buf_2[MAX_LOOP_SAMPLES];
 static constexpr float FREEZE_LO = 0.40f;
 static constexpr float FREEZE_HI = 0.60f;
 
+// Unity-speed (1×) grace zone: ±5% of total travel around the 1× point
+static constexpr float UNITY_LO = 0.75f;
+static constexpr float UNITY_HI = 0.85f;
+
 static constexpr float TWO_PI = 6.283185307f;
 static constexpr float SAMPLE_RATE_F = 48000.f;
 
@@ -79,13 +84,21 @@ static float KnobToSpeed(float knob, bool semitone_snap) {
   float speed;
 
   if (knob <= FREEZE_LO) {
+    // 0.0 → 0.5x,  FREEZE_LO → 0x
     float t = knob / FREEZE_LO;
     speed = 0.5f * (1.0f - t);
-  } else if (knob >= FREEZE_HI) {
-    float t = (knob - FREEZE_HI) / (1.0f - FREEZE_HI);
-    speed = 2.0f * t;
+  } else if (knob < FREEZE_HI) {
+    return 0.0f;  // frozen zone
+  } else if (knob < UNITY_LO) {
+    // FREEZE_HI → 0x,  UNITY_LO → 1x
+    float t = (knob - FREEZE_HI) / (UNITY_LO - FREEZE_HI);
+    speed = t;
+  } else if (knob <= UNITY_HI) {
+    speed = 1.0f;  // 1× grace zone
   } else {
-    return 0.0f;
+    // UNITY_HI → 1x,  1.0 → 2x
+    float t = (knob - UNITY_HI) / (1.0f - UNITY_HI);
+    speed = 1.0f + t;
   }
 
   if (semitone_snap && speed > 0.01f) {
