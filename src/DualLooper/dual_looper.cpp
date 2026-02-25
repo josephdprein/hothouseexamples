@@ -1,6 +1,6 @@
 // DualLooper for Hothouse DIY DSP Platform
 // Two independent loop samplers with variable-speed playback,
-// semitone quantization, reverse, and warble modulation.
+// semitone quantization, reverse, overdub, and random warble.
 //
 // LOOPER 1                          LOOPER 2
 // --------                          --------
@@ -9,23 +9,33 @@
 // Knob 3: Warble depth              Knob 6: Warble depth
 // Switch 1 UP:   Semitone snap      Switch 2 UP:   Semitone snap
 // Switch 1 DOWN: Reverse            Switch 2 DOWN: Reverse
-// Footswitch 1:  Record/Stop        Footswitch 2:  Record/Stop
+// Footswitch 1:  See below          Footswitch 2:  See below
 //
 // Switch 3: Global warble intensity for both loopers
 //   UP   = intense warble
 //   MID  = no warble
 //   DOWN = subtle warble
 //
-// Warble uses filtered random noise (slow drift + fast flutter)
-// for an organic, tape-like wobble rather than periodic modulation.
+// Footswitch (short press):
+//   a) No loop, not recording  → start recording
+//   b) No loop, recording      → set loop end, begin playing, keep recording
+//                                 (overdub)
+//   c) Has loop, recording     → stop overdubbing
+//   d) Has loop, not recording → loop mode: toggle play/stop
+//                                 one-shot mode: trigger from beginning
+//
+// Footswitch (hold ≥1 s):
+//   a) Not playing → erase loop (LED blinks 3×)
+//   b) Playing     → stop, toggle between one-shot (1 blink) /
+//                     loop mode (2 blinks)
 //
 // Speed knob mapping:
 //   Fully CCW  = half speed (0.5x)
 //   Noon ±10%  = frozen (sample-and-hold)
 //   Fully CW   = double speed (2x)
 //
-// LED 1 blinks while recording looper 1, solid when loop exists.
-// LED 2 blinks while recording looper 2, solid when loop exists.
+// LED: blinks while recording/overdubbing, solid while playing, off otherwise.
+// Feedback blinks temporarily override normal LED state.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -59,22 +69,23 @@ static constexpr float FREEZE_HI = 0.60f;
 static constexpr float TWO_PI = 6.283185307f;
 static constexpr float SAMPLE_RATE_F = 48000.f;
 
-// Convert a 0–1 knob value to a playback rate.
-// CCW = 0.5x, noon dead-zone = frozen, CW = 2x.
-// When semitone_snap is true, quantize to nearest semitone.
+// Hold threshold for long-press detection (ms)
+static constexpr uint32_t HOLD_MS = 1000;
+
+// ---------------------------------------------------------------------------
+// Speed knob → playback rate
+// ---------------------------------------------------------------------------
 static float KnobToSpeed(float knob, bool semitone_snap) {
   float speed;
 
   if (knob <= FREEZE_LO) {
-    // 0.0 → 0.5x,  FREEZE_LO → 0x
-    float t = knob / FREEZE_LO;            // 0 … 1
+    float t = knob / FREEZE_LO;
     speed = 0.5f * (1.0f - t);
   } else if (knob >= FREEZE_HI) {
-    // FREEZE_HI → 0x,  1.0 → 2x
-    float t = (knob - FREEZE_HI) / (1.0f - FREEZE_HI);  // 0 … 1
+    float t = (knob - FREEZE_HI) / (1.0f - FREEZE_HI);
     speed = 2.0f * t;
   } else {
-    return 0.0f;  // frozen zone
+    return 0.0f;
   }
 
   if (semitone_snap && speed > 0.01f) {
@@ -88,39 +99,47 @@ static float KnobToSpeed(float knob, bool semitone_snap) {
   return speed;
 }
 
-// Simple pseudo-random noise via LCG, returns -1 … +1
+// ---------------------------------------------------------------------------
+// Filtered random noise helpers
+// ---------------------------------------------------------------------------
 static float RandFloat(uint32_t &state) {
   state = state * 1664525u + 1013904223u;
   return static_cast<float>(static_cast<int32_t>(state)) / 2147483648.0f;
 }
 
-// One-pole lowpass coefficient from cutoff frequency
 static inline float OnePoleCoeff(float freq_hz) {
   return 1.0f - expf(-TWO_PI * freq_hz / SAMPLE_RATE_F);
 }
 
+// ---------------------------------------------------------------------------
+// Looper
+// ---------------------------------------------------------------------------
 struct Looper {
   float *buffer;
-  size_t loop_length;  // recorded length in samples
-  float read_pos;      // fractional playback head
-  size_t rec_pos;      // write head during recording
+  size_t loop_length;
+  float read_pos;
+  size_t rec_pos;
 
   bool recording;
   bool has_loop;
+  bool playing;
+  bool loop_mode;  // true = continuous loop, false = one-shot
 
-  // Parameters (updated each block from knobs/switches)
+  // Knob / switch parameters
   float speed;
   float level;
   float warble_depth;
   bool reverse;
   bool semitone_snap;
 
-  // Random warble state — two filtered noise bands per looper
-  // so each looper drifts independently
+  // Random warble — three filtered-noise bands per looper
   uint32_t rng_state;
-  float noise_slow;     // filtered at ~1 Hz  — slow wow drift
-  float noise_mid;      // filtered at ~4 Hz  — medium wander
-  float noise_fast;     // filtered at ~12 Hz — fast flutter
+  float noise_slow;
+  float noise_mid;
+  float noise_fast;
+
+  // LED feedback blink request (set from audio ISR, consumed by main loop)
+  volatile int led_blink_count;
 
   void Init(float *buf, uint32_t seed) {
     buffer = buf;
@@ -129,6 +148,8 @@ struct Looper {
     rec_pos = 0;
     recording = false;
     has_loop = false;
+    playing = false;
+    loop_mode = true;
     speed = 0.0f;
     level = 1.0f;
     warble_depth = 0.0f;
@@ -138,44 +159,94 @@ struct Looper {
     noise_slow = 0.0f;
     noise_mid = 0.0f;
     noise_fast = 0.0f;
+    led_blink_count = 0;
   }
 
-  void ToggleRecord() {
-    if (!recording) {
+  // --- Footswitch actions ------------------------------------------------
+
+  void NormalPress() {
+    if (!has_loop && !recording) {
+      // (a) Start recording
       recording = true;
       rec_pos = 0;
       loop_length = 0;
-      has_loop = false;
-    } else {
-      recording = false;
+    } else if (!has_loop && recording) {
+      // (b) Set loop end, begin playing, keep recording (overdub)
       loop_length = rec_pos;
-      has_loop = (loop_length > 0);
-      read_pos = 0.0f;
+      has_loop = (loop_length > 1);
+      if (has_loop) {
+        playing = true;
+        read_pos = 0.0f;
+        // recording stays true → overdub
+      } else {
+        recording = false;  // too short, cancel
+      }
+    } else if (has_loop && recording) {
+      // (c) Stop overdubbing
+      recording = false;
+    } else if (has_loop && !recording) {
+      // (d) Mode-dependent playback
+      if (loop_mode) {
+        if (playing) {
+          playing = false;
+        } else {
+          read_pos = 0.0f;
+          playing = true;
+        }
+      } else {
+        // One-shot: always trigger from beginning
+        read_pos = 0.0f;
+        playing = true;
+      }
     }
   }
 
-  // Returns the loop playback sample (wet only, no dry).
-  // Writes incoming audio into the buffer while recording.
+  void LongPress() {
+    if (!playing) {
+      // (a) Erase — clear everything
+      has_loop = false;
+      recording = false;
+      loop_length = 0;
+      rec_pos = 0;
+      read_pos = 0.0f;
+      led_blink_count = 3;
+    } else {
+      // (b) Stop playback, stop any overdub, toggle mode
+      playing = false;
+      recording = false;
+      loop_mode = !loop_mode;
+      led_blink_count = loop_mode ? 2 : 1;
+    }
+  }
+
+  // --- Per-sample audio --------------------------------------------------
+
   float Process(float in) {
-    // --- Recording --------------------------------------------------
-    if (recording) {
+    // Initial recording — no loop exists yet
+    if (recording && !has_loop) {
       if (rec_pos < MAX_LOOP_SAMPLES) {
         buffer[rec_pos++] = in;
       }
-      return 0.0f;  // no playback output while recording
+      return 0.0f;
     }
 
     if (!has_loop || loop_length < 2) {
       return 0.0f;
     }
 
-    // --- Random warble ----------------------------------------------
+    // Overdub: mix input into buffer at current playback position
+    if (recording && playing) {
+      size_t wr = static_cast<size_t>(read_pos) % loop_length;
+      buffer[wr] = daisysp::SoftClip(buffer[wr] + in);
+    }
+
+    if (!playing) {
+      return 0.0f;
+    }
+
+    // --- Random warble ----------------------------------------------------
     float effective_speed = speed;
     if (warble_depth > 0.001f && speed > 0.001f) {
-      // Three filtered noise bands for organic, non-repeating wobble:
-      //   slow (~1 Hz)  — broad pitch drift
-      //   mid  (~4 Hz)  — irregular wander
-      //   fast (~12 Hz) — subtle flutter / grit
       float raw = RandFloat(rng_state);
       noise_slow += OnePoleCoeff(1.0f) * (raw - noise_slow);
       raw = RandFloat(rng_state);
@@ -186,16 +257,13 @@ struct Looper {
       float wobble = 0.55f * noise_slow +
                      0.30f * noise_mid +
                      0.15f * noise_fast;
-
       effective_speed = speed * (1.0f + warble_depth * wobble);
       if (effective_speed < 0.0f) effective_speed = 0.0f;
     }
 
-    // --- Read with linear interpolation -----------------------------
+    // --- Read with linear interpolation -----------------------------------
     float pos = read_pos;
     float flen = static_cast<float>(loop_length);
-
-    // Wrap into range
     while (pos < 0.0f) pos += flen;
     while (pos >= flen) pos -= flen;
 
@@ -204,8 +272,9 @@ struct Looper {
     float frac = pos - static_cast<float>(idx0);
     float sample = buffer[idx0] * (1.0f - frac) + buffer[idx1] * frac;
 
-    // --- Advance playback head --------------------------------------
+    // --- Advance playback head --------------------------------------------
     if (effective_speed > 0.001f) {
+      float prev_pos = read_pos;
       if (reverse) {
         read_pos -= effective_speed;
         if (read_pos < 0.0f) read_pos += flen;
@@ -213,33 +282,79 @@ struct Looper {
         read_pos += effective_speed;
         if (read_pos >= flen) read_pos -= flen;
       }
+
+      // One-shot: stop when the head wraps past the loop boundary
+      if (!loop_mode) {
+        bool wrapped = reverse ? (read_pos > prev_pos) : (read_pos < prev_pos);
+        if (wrapped) {
+          playing = false;
+          recording = false;
+          read_pos = 0.0f;
+        }
+      }
     }
 
     return sample * level;
   }
 };
 
-Looper looper1, looper2;
+// ---------------------------------------------------------------------------
+// Footswitch hold-detection (fires NormalPress on release, LongPress on hold)
+// ---------------------------------------------------------------------------
+struct FootswitchTracker {
+  bool prev_pressed;
+  bool long_triggered;
+  uint32_t press_start;
 
+  void Process(bool pressed, Looper &looper) {
+    if (pressed && !prev_pressed) {
+      press_start = System::GetNow();
+      long_triggered = false;
+    }
+
+    if (pressed && !long_triggered &&
+        (System::GetNow() - press_start) >= HOLD_MS) {
+      looper.LongPress();
+      long_triggered = true;
+    }
+
+    if (!pressed && prev_pressed && !long_triggered) {
+      looper.NormalPress();
+    }
+
+    prev_pressed = pressed;
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Globals
+// ---------------------------------------------------------------------------
+Looper looper1, looper2;
+FootswitchTracker fs1 = {false, false, 0};
+FootswitchTracker fs2 = {false, false, 0};
 Led led1, led2;
 
+// ---------------------------------------------------------------------------
+// Audio callback
+// ---------------------------------------------------------------------------
 void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
                    size_t size) {
   hw.ProcessAllControls();
 
-  // ---- Switch 3: global warble intensity for both loopers ----------
-  //   UP   = intense (knob scales 0–0.5)
-  //   MID  = none    (warble off regardless of knob)
-  //   DOWN = subtle  (knob scales 0–0.15)
+  // ---- Footswitch handling (hold-aware) --------------------------------
+  fs1.Process(hw.switches[Hothouse::FOOTSWITCH_1].Pressed(), looper1);
+  fs2.Process(hw.switches[Hothouse::FOOTSWITCH_2].Pressed(), looper2);
+
+  // ---- Switch 3: global warble intensity -------------------------------
   float warble_scale = 0.0f;
   auto sw3 = hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_3);
   if (sw3 == Hothouse::TOGGLESWITCH_UP) {
-    warble_scale = 0.5f;   // intense
+    warble_scale = 0.5f;
   } else if (sw3 == Hothouse::TOGGLESWITCH_DOWN) {
-    warble_scale = 0.15f;  // subtle
+    warble_scale = 0.15f;
   }
 
-  // ---- Looper 1 controls (knobs 1-3, switch 1, footswitch 1) ------
+  // ---- Looper 1 knobs / switches --------------------------------------
   float k1 = hw.GetKnobValue(Hothouse::KNOB_1);
   float k2 = hw.GetKnobValue(Hothouse::KNOB_2);
   float k3 = hw.GetKnobValue(Hothouse::KNOB_3);
@@ -247,16 +362,11 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
   auto sw1 = hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_1);
   looper1.semitone_snap = (sw1 == Hothouse::TOGGLESWITCH_UP);
   looper1.reverse = (sw1 == Hothouse::TOGGLESWITCH_DOWN);
-
   looper1.speed = KnobToSpeed(k1, looper1.semitone_snap);
   looper1.level = k2;
   looper1.warble_depth = k3 * warble_scale;
 
-  if (hw.switches[Hothouse::FOOTSWITCH_1].RisingEdge()) {
-    looper1.ToggleRecord();
-  }
-
-  // ---- Looper 2 controls (knobs 4-6, switch 2, footswitch 2) ------
+  // ---- Looper 2 knobs / switches --------------------------------------
   float k4 = hw.GetKnobValue(Hothouse::KNOB_4);
   float k5 = hw.GetKnobValue(Hothouse::KNOB_5);
   float k6 = hw.GetKnobValue(Hothouse::KNOB_6);
@@ -264,27 +374,54 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
   auto sw2 = hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_2);
   looper2.semitone_snap = (sw2 == Hothouse::TOGGLESWITCH_UP);
   looper2.reverse = (sw2 == Hothouse::TOGGLESWITCH_DOWN);
-
   looper2.speed = KnobToSpeed(k4, looper2.semitone_snap);
   looper2.level = k5;
   looper2.warble_depth = k6 * warble_scale;
 
-  if (hw.switches[Hothouse::FOOTSWITCH_2].RisingEdge()) {
-    looper2.ToggleRecord();
-  }
-
-  // ---- Audio processing --------------------------------------------
+  // ---- Per-sample processing -------------------------------------------
   for (size_t i = 0; i < size; ++i) {
     float dry = in[0][i];
     float wet1 = looper1.Process(dry);
     float wet2 = looper2.Process(dry);
-
-    // Mix dry + both loopers, soft-clip to prevent digital overs
-    float mix = dry + wet1 + wet2;
-    out[0][i] = out[1][i] = daisysp::SoftClip(mix);
+    out[0][i] = out[1][i] = daisysp::SoftClip(dry + wet1 + wet2);
   }
 }
 
+// ---------------------------------------------------------------------------
+// LED helper — handles feedback blinks then falls back to normal state
+// ---------------------------------------------------------------------------
+static void UpdateLed(Led &led, Looper &looper,
+                      int &blink_remaining, int &blink_timer,
+                      uint32_t tick) {
+  // Check for a new blink request from the audio ISR
+  int req = looper.led_blink_count;
+  if (req > 0) {
+    looper.led_blink_count = 0;
+    blink_remaining = req;
+    blink_timer = 0;
+  }
+
+  if (blink_remaining > 0) {
+    // Each blink: 80 ms on + 80 ms off = 160 ms per blink (8 ticks × 2)
+    bool on = (blink_timer % 16) < 8;
+    led.Set(on ? 1.0f : 0.0f);
+    blink_timer++;
+    if (blink_timer >= blink_remaining * 16) {
+      blink_remaining = 0;
+    }
+  } else if (looper.recording) {
+    // Blink while recording / overdubbing (~5 Hz)
+    led.Set((tick % 10 < 5) ? 1.0f : 0.0f);
+  } else {
+    led.Set(looper.playing ? 1.0f : 0.0f);
+  }
+
+  led.Update();
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 int main() {
   hw.Init();
   hw.SetAudioBlockSize(4);
@@ -299,27 +436,15 @@ int main() {
   hw.StartAdc();
   hw.StartAudio(AudioCallback);
 
-  uint32_t blink_counter = 0;
+  int blink1_remaining = 0, blink1_timer = 0;
+  int blink2_remaining = 0, blink2_timer = 0;
+  uint32_t tick = 0;
 
   while (true) {
     hw.DelayMs(10);
-    blink_counter++;
-
-    // LED 1: blink while recording, solid when loop captured, off otherwise
-    if (looper1.recording) {
-      led1.Set((blink_counter % 10 < 5) ? 1.0f : 0.0f);
-    } else {
-      led1.Set(looper1.has_loop ? 1.0f : 0.0f);
-    }
-    led1.Update();
-
-    // LED 2: same for looper 2
-    if (looper2.recording) {
-      led2.Set((blink_counter % 10 < 5) ? 1.0f : 0.0f);
-    } else {
-      led2.Set(looper2.has_loop ? 1.0f : 0.0f);
-    }
-    led2.Update();
+    tick++;
+    UpdateLed(led1, looper1, blink1_remaining, blink1_timer, tick);
+    UpdateLed(led2, looper2, blink2_remaining, blink2_timer, tick);
   }
 
   return 0;
