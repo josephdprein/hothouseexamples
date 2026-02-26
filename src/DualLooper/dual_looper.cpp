@@ -79,6 +79,17 @@ static constexpr float SAMPLE_RATE_F = 48000.f;
 static constexpr uint32_t MODE_MS  = 1000;  // stop (if playing) or toggle loop/one-shot (if stopped)
 static constexpr uint32_t ERASE_MS = 2000;  // erase (if hold started while stopped)
 
+// Fade / splice constants
+// FADE_RATE: one-pole coefficient for output and overdub envelopes.
+//   τ ≈ 1 / (FADE_RATE × 48 000) ≈ 4 ms — fast enough to feel snappy,
+//   slow enough to silence any click on every play/stop transition.
+static constexpr float  FADE_RATE = 0.005f;
+// XFADE_LEN: samples baked into each end of the loop buffer when a loop
+//   is committed.  128 samples ≈ 2.7 ms — inaudible as a fade but enough
+//   to guarantee silence at the splice point regardless of where the
+//   musician pressed the footswitch.
+static constexpr size_t XFADE_LEN = 128;
+
 // ---------------------------------------------------------------------------
 // Speed knob → playback rate
 //
@@ -155,6 +166,13 @@ struct Looper {
   float noise_mid;
   float noise_fast;
 
+  // Smooth amplitude envelopes — prevent clicks on every state transition.
+  // fade_gain    : output level, ramps 0→1 when playback starts, 1→0 when stopped.
+  // overdub_gain : overdub-input mix level, ramps in/out so no transient is
+  //               baked into the loop buffer when overdub is toggled.
+  float fade_gain;
+  float overdub_gain;
+
   // LED feedback blink request (set from audio ISR, consumed by main loop)
   volatile int led_blink_count;
 
@@ -176,6 +194,8 @@ struct Looper {
     noise_slow = 0.0f;
     noise_mid = 0.0f;
     noise_fast = 0.0f;
+    fade_gain    = 0.0f;
+    overdub_gain = 0.0f;
     led_blink_count = 0;
   }
 
@@ -192,6 +212,16 @@ struct Looper {
       loop_length = rec_pos;
       has_loop = (loop_length > 1);
       if (has_loop) {
+        // Bake a short linear fade into both ends of the buffer so the loop
+        // splice point is silent regardless of where the footswitch was pressed.
+        // Uses at most XFADE_LEN samples per end; capped at loop_length/2 so
+        // the fade-in and fade-out regions never overlap on very short loops.
+        size_t xfade = (XFADE_LEN < loop_length / 2) ? XFADE_LEN : loop_length / 2;
+        for (size_t i = 0; i < xfade; ++i) {
+          float t = static_cast<float>(i) / static_cast<float>(xfade);
+          buffer[i]                   *= t;  // fade in  at loop start
+          buffer[loop_length - 1 - i] *= t;  // fade out at loop end
+        }
         playing = true;
         recording = false;
         read_pos = 0.0f;
@@ -246,81 +276,108 @@ struct Looper {
   // --- Per-sample audio --------------------------------------------------
 
   float Process(float in) {
-    // Initial recording — no loop exists yet
+    // Initial recording — no loop exists yet.
+    // Keep fade_gain at zero so output is silent throughout.
     if (recording && !has_loop) {
       if (rec_pos < MAX_LOOP_SAMPLES) {
         buffer[rec_pos++] = in;
       }
+      fade_gain = 0.0f;
       return 0.0f;
     }
 
     if (!has_loop || loop_length < 2) {
+      fade_gain = 0.0f;
       return 0.0f;
     }
 
-    if (!playing) {
+    // --- Output amplitude envelope ----------------------------------------
+    // Ramps smoothly toward 1.0 while playing and toward 0.0 while stopped.
+    // This eliminates hard-cut pops on every play/stop/one-shot transition.
+    float target_gain = playing ? 1.0f : 0.0f;
+    fade_gain += FADE_RATE * (target_gain - fade_gain);
+
+    // Once fully silent and not playing, skip all per-sample work.
+    if (fade_gain < 0.001f && !playing) {
+      overdub_gain = 0.0f;
       return 0.0f;
     }
+
+    float flen = static_cast<float>(loop_length);
+
+    // Normalise read position (read_pos is kept clean by the advance code,
+    // but guard here in case of edge cases to avoid UB on size_t cast).
+    float pos = read_pos;
+    while (pos <  0.0f) pos += flen;
+    while (pos >= flen) pos -= flen;
 
     // --- Random warble ----------------------------------------------------
     float effective_speed = speed;
     if (warble_depth > 0.001f && speed > 0.001f) {
       float raw = RandFloat(rng_state);
-      noise_slow += OnePoleCoeff(1.0f) * (raw - noise_slow);
+      noise_slow += OnePoleCoeff(1.0f)  * (raw - noise_slow);
       raw = RandFloat(rng_state);
-      noise_mid += OnePoleCoeff(4.0f) * (raw - noise_mid);
+      noise_mid  += OnePoleCoeff(4.0f)  * (raw - noise_mid);
       raw = RandFloat(rng_state);
       noise_fast += OnePoleCoeff(12.0f) * (raw - noise_fast);
 
       float wobble = 0.55f * noise_slow +
-                     0.30f * noise_mid +
+                     0.30f * noise_mid  +
                      0.15f * noise_fast;
       effective_speed = speed * (1.0f + warble_depth * wobble);
       if (effective_speed < 0.0f) effective_speed = 0.0f;
+      // Cap upward excursion: at 4× the while-loop normalisation below stays
+      // bounded, and aliasing from skipping samples stays inaudible.
+      if (effective_speed > 4.0f) effective_speed = 4.0f;
     }
 
-    // Overdub: mix input into buffer at current playback position.
-    // Only write when the head is actually moving so a frozen loop
-    // doesn't saturate a single sample.
-    if (recording && effective_speed > 0.001f) {
-      size_t wr = static_cast<size_t>(read_pos) % loop_length;
-      buffer[wr] = daisysp::SoftClip(buffer[wr] + in);
+    // --- Overdub: mix input into buffer with a faded blend ----------------
+    // Ramp overdub_gain in when overdub starts and out when it stops so no
+    // sudden transient is baked permanently into the loop buffer.
+    {
+      float target_od = (recording && effective_speed > 0.001f) ? 1.0f : 0.0f;
+      overdub_gain += FADE_RATE * (target_od - overdub_gain);
+      if (overdub_gain > 0.001f) {
+        size_t wr = static_cast<size_t>(pos) % loop_length;
+        buffer[wr] = daisysp::SoftClip(buffer[wr] + in * overdub_gain);
+      }
     }
 
     // --- Read with linear interpolation -----------------------------------
-    float pos = read_pos;
-    float flen = static_cast<float>(loop_length);
-    while (pos < 0.0f) pos += flen;
-    while (pos >= flen) pos -= flen;
-
     size_t idx0 = static_cast<size_t>(pos);
     size_t idx1 = (idx0 + 1 < loop_length) ? idx0 + 1 : 0;
-    float frac = pos - static_cast<float>(idx0);
+    float frac   = pos - static_cast<float>(idx0);
     float sample = buffer[idx0] * (1.0f - frac) + buffer[idx1] * frac;
 
-    // --- Advance playback head --------------------------------------------
-    if (effective_speed > 0.001f) {
+    // --- Advance playback head (only while actually playing) --------------
+    // Gating on `playing` means read_pos stays frozen during the fade-out
+    // window after a stop, so the tail decays from a fixed position rather
+    // than sweeping through the buffer while going quiet.
+    if (playing && effective_speed > 0.001f) {
       float prev_pos = read_pos;
       if (reverse) {
         read_pos -= effective_speed;
-        if (read_pos < 0.0f) read_pos += flen;
+        // Use while-loop so any effective_speed > flen (e.g., heavy warble
+        // on a very short loop) still normalises correctly.
+        while (read_pos < 0.0f) read_pos += flen;
       } else {
         read_pos += effective_speed;
-        if (read_pos >= flen) read_pos -= flen;
+        while (read_pos >= flen) read_pos -= flen;
       }
 
-      // One-shot: stop automatically when the head wraps past the boundary
+      // One-shot: stop automatically when the head wraps past the boundary.
+      // fade_gain will decay to zero over the next ~4 ms — no hard cut.
       if (!loop_mode) {
         bool wrapped = reverse ? (read_pos > prev_pos) : (read_pos < prev_pos);
         if (wrapped) {
-          playing = false;
+          playing   = false;
           recording = false;
-          read_pos = 0.0f;
+          read_pos  = 0.0f;
         }
       }
     }
 
-    return sample * level;
+    return sample * level * fade_gain;
   }
 };
 
