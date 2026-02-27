@@ -1,13 +1,13 @@
 // DualLooper for Hothouse DIY DSP Platform
 // Two independent loop samplers with variable-speed playback,
-// semitone quantization, reverse, overdub, and random warble.
+// speed quantisation, reverse, overdub, and random warble.
 //
 // LOOPER 1                          LOOPER 2
 // --------                          --------
 // Knob 1: Speed                     Knob 4: Speed
 // Knob 2: Level                     Knob 5: Level
 // Knob 3: Warble                    Knob 6: Warble
-// Switch 1 UP:   Semitone snap      Switch 2 UP:   Semitone snap
+// Switch 1 UP:   Quantise           Switch 2 UP:   Quantise
 // Switch 1 DOWN: Reverse            Switch 2 DOWN: Reverse
 // Footswitch 1:  See below          Footswitch 2:  See below
 //
@@ -31,10 +31,14 @@
 // Footswitch (hold ≥2 s, starting from stopped):
 //   a) Stopped, has loop  → erase loop (LED blinks 3×)
 //
-// Speed knob mapping:
-//   Fully CCW   = frozen (sample-and-hold, 0×)
+// Speed knob mapping (continuous):
+//   Fully CCW   = stutter (0×, like CD skipping)
 //   Noon ±5%    = unity speed (1×) grace zone
-//   Fully CW    = double speed (2×)
+//   Fully CW    = quadruple speed (4×)
+//
+// Quantised mode (switch up) latches to: 0×, 0.25×, 0.5×, 1×, 2×, 4×
+//   Switching to quantised:   snaps to nearest value above.
+//   Switching from quantised: holds current speed until knob moves.
 //
 // LED: fast blink while recording, slow pulse while overdubbing,
 //      solid while playing, off otherwise.
@@ -65,12 +69,21 @@ Hothouse hw;
 float DSY_SDRAM_BSS loop_buf_1[MAX_LOOP_SAMPLES];
 float DSY_SDRAM_BSS loop_buf_2[MAX_LOOP_SAMPLES];
 
-// Frozen zone: CCW extreme → FREEZE_HI (5% of travel)
+// Stutter / frozen zone: CCW extreme → FREEZE_HI (5% of travel)
 static constexpr float FREEZE_HI = 0.05f;
+
+// Piecewise-linear breakpoints where named speeds sit on the knob
+static constexpr float KNOB_025X = 0.20f;  // 0.25× speed
+static constexpr float KNOB_05X  = 0.35f;  // 0.5×  speed
 
 // Unity-speed (1×) grace zone: ±5% around noon (center of travel)
 static constexpr float UNITY_LO = 0.45f;
 static constexpr float UNITY_HI = 0.55f;
+
+static constexpr float KNOB_2X = 0.70f;    // 2× speed  (4× at knob = 1.0)
+
+// Minimum knob travel before speed updates after a quantise mode switch
+static constexpr float KNOB_CATCH = 0.03f;
 
 static constexpr float TWO_PI = 6.283185307f;
 static constexpr float SAMPLE_RATE_F = 48000.f;
@@ -91,40 +104,55 @@ static constexpr float  FADE_RATE = 0.005f;
 static constexpr size_t XFADE_LEN = 128;
 
 // ---------------------------------------------------------------------------
-// Speed knob → playback rate
+// Speed knob → playback rate (continuous / unquantised)
 //
 // Zone layout (knob 0.0 = fully CCW, 1.0 = fully CW):
-//   0.00 – 0.05 : frozen (0×)          — CCW extreme
-//   0.05 – 0.45 : 0× → 1×             — slow ramp (0.5× lands ~25%)
+//   0.00 – 0.05 : stutter (0×)         — CCW extreme
+//   0.05 – 0.20 : 0× → 0.25×
+//   0.20 – 0.35 : 0.25× → 0.5×
+//   0.35 – 0.45 : 0.5× → 1×
 //   0.45 – 0.55 : 1× grace zone        — noon ±5%
-//   0.55 – 1.00 : 1× → 2×             — fast ramp
+//   0.55 – 0.70 : 1× → 2×
+//   0.70 – 1.00 : 2× → 4×
 // ---------------------------------------------------------------------------
-static float KnobToSpeed(float knob, bool semitone_snap) {
-  float speed;
-
+static float KnobToSpeed(float knob) {
   if (knob < FREEZE_HI) {
-    return 0.0f;  // frozen zone — CCW extreme
+    return 0.0f;                            // stutter zone — CCW extreme
+  } else if (knob < KNOB_025X) {
+    float t = (knob - FREEZE_HI) / (KNOB_025X - FREEZE_HI);
+    return t * 0.25f;                       // 0× → 0.25×
+  } else if (knob < KNOB_05X) {
+    float t = (knob - KNOB_025X) / (KNOB_05X - KNOB_025X);
+    return 0.25f + t * 0.25f;              // 0.25× → 0.5×
   } else if (knob < UNITY_LO) {
-    // Smooth ramp: 0× at FREEZE_HI, 1× at UNITY_LO
-    float t = (knob - FREEZE_HI) / (UNITY_LO - FREEZE_HI);
-    speed = t;
+    float t = (knob - KNOB_05X) / (UNITY_LO - KNOB_05X);
+    return 0.5f + t * 0.5f;               // 0.5× → 1×
   } else if (knob <= UNITY_HI) {
-    speed = 1.0f;  // unity grace zone — noon ±5%
+    return 1.0f;                            // unity grace zone — noon ±5%
+  } else if (knob < KNOB_2X) {
+    float t = (knob - UNITY_HI) / (KNOB_2X - UNITY_HI);
+    return 1.0f + t * 1.0f;               // 1× → 2×
   } else {
-    // UNITY_HI → 1×,  1.0 → 2×
-    float t = (knob - UNITY_HI) / (1.0f - UNITY_HI);
-    speed = 1.0f + t;
+    float t = (knob - KNOB_2X) / (1.0f - KNOB_2X);
+    return 2.0f + t * 2.0f;               // 2× → 4×
   }
+}
 
-  if (semitone_snap && speed > 0.01f) {
-    float semitones = 12.0f * log2f(speed);
-    semitones = roundf(semitones);
-    if (semitones < -12.0f) semitones = -12.0f;
-    if (semitones > 12.0f) semitones = 12.0f;
-    speed = powf(2.0f, semitones / 12.0f);
+// ---------------------------------------------------------------------------
+// Snap a continuous speed value to the nearest quantised step.
+// ---------------------------------------------------------------------------
+static float SnapToQuantised(float speed) {
+  static constexpr float vals[] = {0.0f, 0.25f, 0.5f, 1.0f, 2.0f, 4.0f};
+  float best = vals[0];
+  float best_d = fabsf(speed - vals[0]);
+  for (int i = 1; i < 6; i++) {
+    float d = fabsf(speed - vals[i]);
+    if (d < best_d) {
+      best = vals[i];
+      best_d = d;
+    }
   }
-
-  return speed;
+  return best;
 }
 
 // ---------------------------------------------------------------------------
@@ -158,7 +186,14 @@ struct Looper {
   float level;
   float warble_depth;
   bool reverse;
-  bool semitone_snap;
+  bool quantize;
+
+  // Quantise-mode latch: holds speed steady when switching away from
+  // quantised mode until the knob moves past KNOB_CATCH.
+  bool prev_quantize;
+  float latched_speed;
+  float latched_knob;
+  bool knob_latched;
 
   // Random warble — three filtered-noise bands per looper
   uint32_t rng_state;
@@ -189,7 +224,11 @@ struct Looper {
     level = 1.0f;
     warble_depth = 0.0f;
     reverse = false;
-    semitone_snap = false;
+    quantize = false;
+    prev_quantize = false;
+    latched_speed = 0.0f;
+    latched_knob = 0.0f;
+    knob_latched = false;
     rng_state = seed;
     noise_slow = 0.0f;
     noise_mid = 0.0f;
@@ -326,9 +365,9 @@ struct Looper {
                      0.15f * noise_fast;
       effective_speed = speed * (1.0f + warble_depth * wobble);
       if (effective_speed < 0.0f) effective_speed = 0.0f;
-      // Cap upward excursion: at 4× the while-loop normalisation below stays
-      // bounded, and aliasing from skipping samples stays inaudible.
-      if (effective_speed > 4.0f) effective_speed = 4.0f;
+      // Cap upward excursion so the while-loop normalisation below stays
+      // bounded and aliasing from skipping samples stays inaudible.
+      if (effective_speed > 8.0f) effective_speed = 8.0f;
     }
 
     // --- Overdub: mix input into buffer with a faded blend ----------------
@@ -424,6 +463,38 @@ struct FootswitchTracker {
 };
 
 // ---------------------------------------------------------------------------
+// Update a looper's speed from its knob, handling quantise latch logic.
+//   – Switching into quantised mode: snap to nearest {0,0.25,0.5,1,2,4}.
+//   – Switching out of quantised mode: hold the quantised speed until the
+//     knob moves past KNOB_CATCH, preventing a jump.
+// ---------------------------------------------------------------------------
+static void UpdateSpeed(Looper &lp, float knob, bool quantize) {
+  bool mode_changed = (quantize != lp.prev_quantize);
+  lp.prev_quantize = quantize;
+  lp.quantize = quantize;
+
+  if (mode_changed && !quantize) {
+    // Leaving quantised mode — latch the current speed in place.
+    lp.latched_speed = lp.speed;
+    lp.latched_knob  = knob;
+    lp.knob_latched  = true;
+  }
+  // Entering quantised mode needs no latch; the snap is intentional.
+
+  if (lp.knob_latched) {
+    if (fabsf(knob - lp.latched_knob) > KNOB_CATCH) {
+      lp.knob_latched = false;
+    } else {
+      lp.speed = lp.latched_speed;
+      return;
+    }
+  }
+
+  float raw = KnobToSpeed(knob);
+  lp.speed = quantize ? SnapToQuantised(raw) : raw;
+}
+
+// ---------------------------------------------------------------------------
 // Globals
 // ---------------------------------------------------------------------------
 Looper looper1, looper2;
@@ -453,9 +524,8 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
   float k3 = hw.GetKnobValue(Hothouse::KNOB_3);
 
   auto sw1 = hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_1);
-  looper1.semitone_snap = (sw1 == Hothouse::TOGGLESWITCH_UP);
   looper1.reverse = (sw1 == Hothouse::TOGGLESWITCH_DOWN);
-  looper1.speed = KnobToSpeed(k1, looper1.semitone_snap);
+  UpdateSpeed(looper1, k1, sw1 == Hothouse::TOGGLESWITCH_UP);
   looper1.level = k2;
   looper1.warble_depth = k3;
 
@@ -465,9 +535,8 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
   float k6 = hw.GetKnobValue(Hothouse::KNOB_6);
 
   auto sw2 = hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_2);
-  looper2.semitone_snap = (sw2 == Hothouse::TOGGLESWITCH_UP);
   looper2.reverse = (sw2 == Hothouse::TOGGLESWITCH_DOWN);
-  looper2.speed = KnobToSpeed(k4, looper2.semitone_snap);
+  UpdateSpeed(looper2, k4, sw2 == Hothouse::TOGGLESWITCH_UP);
   looper2.level = k5;
   looper2.warble_depth = k6;
 
