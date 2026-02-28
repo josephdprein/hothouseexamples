@@ -27,10 +27,6 @@ Hothouse hw;
 Led led_bypass, led_1;
 bool bypass = true;
 
-// Timer for detecting long press on FOOTSWITCH_1
-uint32_t footswitch1_start_time = 0;
-const uint32_t HOLD_THRESHOLD_MS = 1000;  // 1 second hold time
-
 void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
                    size_t size) {
   hw.ProcessAllControls();
@@ -60,26 +56,7 @@ int main() {
     led_bypass.Set(bypass ? 0.0f : 1.0f);
     led_bypass.Update();
 
-    if (hw.switches[Hothouse::FOOTSWITCH_1].Pressed()) {
-      if (footswitch1_start_time == 0) {
-        footswitch1_start_time = System::GetNow();
-      } else if (System::GetNow() - footswitch1_start_time >=
-                 HOLD_THRESHOLD_MS) {
-        // Flash LED_1 three times before resetting
-        for (int i = 0; i < 3; i++) {
-          led_1.Set(1);
-          led_1.Update();
-          hw.DelayMs(120);
-          led_1.Set(0);
-          led_1.Update();
-          hw.DelayMs(120);
-        }
-        System::ResetToBootloader();
-      }
-    } else {
-      // Reset the hold timer when footswitch is released
-      footswitch1_start_time = 0;
-    }
+    hw.CheckResetToBootloader();
   }
 
   return 0;

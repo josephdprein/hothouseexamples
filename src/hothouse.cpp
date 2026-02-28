@@ -46,6 +46,7 @@ constexpr Pin PIN_KNOB_5 = daisy::seed::D20;
 constexpr Pin PIN_KNOB_6 = daisy::seed::D21;
 
 const uint32_t Hothouse::HOLD_THRESHOLD_MS;
+const uint32_t Hothouse::DUAL_SWITCH_HOLD_THRESHOLD_MS;
 
 void Hothouse::Init(bool boost) {
   // Initialize the hardware.
@@ -179,14 +180,15 @@ Hothouse::ToggleswitchPosition Hothouse::GetToggleswitchPosition(
 }
 
 void Hothouse::CheckResetToBootloader() {
-  if (switches[Hothouse::FOOTSWITCH_1].Pressed()) {
-    if (footswitch_start_time[0] == 0) {
-      footswitch_start_time [0]= System::GetNow();
-    } else if (System::GetNow() - footswitch_start_time[0] >= HOLD_THRESHOLD_MS) {
+  if (switches[FOOTSWITCH_1].Pressed() && switches[FOOTSWITCH_2].Pressed()) {
+    if (dual_footswitch_start_time == 0) {
+      dual_footswitch_start_time = System::GetNow();
+    } else if (System::GetNow() - dual_footswitch_start_time >=
+               DUAL_SWITCH_HOLD_THRESHOLD_MS) {
       // Shut 'er down so the LEDs always flash
       StopAdc();
       StopAudio();
-      
+
       daisy::Led _led_1, _led_2;
       _led_1.Init(seed.GetPin(22), false);
       _led_2.Init(seed.GetPin(23), false);
@@ -210,8 +212,8 @@ void Hothouse::CheckResetToBootloader() {
       System::ResetToBootloader();
     }
   } else {
-    // Reset the hold timer if the footswitch is released
-    footswitch_start_time[0] = 0;
+    // Reset the hold timer if either footswitch is released
+    dual_footswitch_start_time = 0;
   }
 }
 

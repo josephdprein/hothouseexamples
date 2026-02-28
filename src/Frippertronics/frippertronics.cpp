@@ -192,6 +192,8 @@ int main() {
     led_erase.Set( ERASING ? 1.0f : 0.0f);
     led_erase.Update();
 
+    hw.CheckResetToBootloader();
+
     // set the delay times here based on the knob value captured in
     // the audio loop
     if (DELAY_TIME_KNOB < 0.25f) {

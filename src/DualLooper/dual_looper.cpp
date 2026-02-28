@@ -624,6 +624,7 @@ int main() {
     tick++;
     UpdateLed(led1, looper1, blink1_remaining, blink1_timer, tick);
     UpdateLed(led2, looper2, blink2_remaining, blink2_timer, tick);
+    hw.CheckResetToBootloader();
   }
 
   return 0;
