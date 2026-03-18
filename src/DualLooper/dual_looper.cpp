@@ -31,11 +31,13 @@
 // Footswitch (hold ≥2 s, starting from stopped):
 //   a) Stopped, has loop  → erase loop (LED blinks 3×)
 //
-// Both footswitches held ≥3 s → save both loops to QSPI flash.
-//   Both LEDs solid during save.  Both LEDs blink 3× on completion.
-//   On next power-up, saved loops are loaded automatically (both LEDs
-//   double-flash to confirm).  Loops load in stopped state; press the
-//   footswitch to start playback.
+// Loops are saved to QSPI flash automatically after:
+//   • A new loop is committed (recording → playing)
+//   • An overdub session ends
+//   • A loop is erased
+// Both LEDs blink 3× after each save completes.  On next power-up the
+// saved loops reload automatically; both LEDs double-flash to confirm.
+// Loops load in stopped state — press the footswitch to start playback.
 //
 // Speed knob mapping:
 //   Fully CCW   = frozen (sample-and-hold, 0×)
@@ -90,7 +92,6 @@ static constexpr float SAMPLE_RATE_F = 48000.f;
 // Hold thresholds
 static constexpr uint32_t MODE_MS  = 1000;  // stop (if playing) or toggle loop/one-shot (if stopped)
 static constexpr uint32_t ERASE_MS = 2000;  // erase (if hold started while stopped)
-static constexpr uint32_t SAVE_HOLD_MS = 3000;  // both footswitches held → save
 
 // Fade / splice constants
 // FADE_RATE: one-pole coefficient for output and overdub envelopes.
@@ -246,8 +247,9 @@ struct Looper {
   }
 
   // --- Footswitch actions ------------------------------------------------
+  // Return true when the loop buffer has changed and should be saved.
 
-  void NormalPress() {
+  bool NormalPress() {
     if (!has_loop && !recording) {
       // (a) Idle → start recording
       recording = true;
@@ -271,6 +273,7 @@ struct Looper {
         playing = true;
         recording = false;
         read_pos = 0.0f;
+        return true;  // new loop committed — save
       } else {
         recording = false;  // too short, cancel
       }
@@ -280,11 +283,13 @@ struct Looper {
     } else if (has_loop && playing && recording) {
       // (d) Overdubbing → stop overdub, keep playing
       recording = false;
+      return true;  // overdub baked into buffer — save
     } else if (has_loop && !playing) {
       // (e) Stopped → start playing from beginning
       read_pos = 0.0f;
       playing = true;
     }
+    return false;
   }
 
   // 1-second hold action
@@ -307,7 +312,7 @@ struct Looper {
   }
 
   // 2-second hold action (only fires when hold started from stopped state)
-  void ErasePress() {
+  bool ErasePress() {
     if (!playing && (has_loop || recording)) {
       bool was_loop = has_loop;
       has_loop = false;
@@ -316,7 +321,9 @@ struct Looper {
       rec_pos = 0;
       read_pos = 0.0f;
       led_blink_count = was_loop ? 3 : 1;
+      return true;  // loop state changed — save (persists the empty state)
     }
+    return false;
   }
 
   // --- Per-sample audio --------------------------------------------------
@@ -440,7 +447,10 @@ struct FootswitchTracker {
   bool started_stopped;  // true when the hold began from a stopped state
   uint32_t press_start;
 
-  void Process(bool pressed, Looper &looper) {
+  // Returns true if the looper's buffer changed and should be saved.
+  bool Process(bool pressed, Looper &looper) {
+    bool needs_save = false;
+
     if (pressed && !prev_pressed) {
       press_start = System::GetNow();
       mode_triggered = false;
@@ -457,15 +467,16 @@ struct FootswitchTracker {
 
     if (pressed && mode_triggered && !erase_triggered &&
         started_stopped && held_ms >= ERASE_MS) {
-      looper.ErasePress();
+      needs_save = looper.ErasePress();
       erase_triggered = true;
     }
 
     if (!pressed && prev_pressed && !mode_triggered) {
-      looper.NormalPress();
+      needs_save = looper.NormalPress();
     }
 
     prev_pressed = pressed;
+    return needs_save;
   }
 };
 
@@ -479,11 +490,6 @@ Led led1, led2;
 
 // Save-request flag written by audio ISR, read and cleared by main loop.
 static volatile bool save_requested = false;
-
-// Dual-footswitch hold tracking (ISR-only state, no volatile needed).
-static bool     dual_held       = false;
-static uint32_t dual_hold_start = 0;
-static bool     dual_triggered  = false;
 
 // ---------------------------------------------------------------------------
 // float ↔ int16 helpers
@@ -642,39 +648,11 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
                    size_t size) {
   hw.ProcessAllControls();
 
-  // ---- Dual-footswitch hold detection (save trigger) --------------------
-  // When both switches are held simultaneously for SAVE_HOLD_MS, a save is
-  // requested.  Individual footswitch processing is suppressed during the
-  // dual hold to prevent ErasePress or unintended ModePress from firing.
-  bool fs1_pressed = hw.switches[Hothouse::FOOTSWITCH_1].Pressed();
-  bool fs2_pressed = hw.switches[Hothouse::FOOTSWITCH_2].Pressed();
-  bool both_pressed = fs1_pressed && fs2_pressed;
-
-  if (both_pressed) {
-    if (!dual_held) {
-      dual_held       = true;
-      dual_hold_start = System::GetNow();
-      dual_triggered  = false;
-    } else if (!dual_triggered &&
-               (System::GetNow() - dual_hold_start) >= SAVE_HOLD_MS) {
-      save_requested = true;
-      dual_triggered = true;
-    }
-  } else {
-    dual_held      = false;
-    dual_triggered = false;
-  }
-
-  // ---- Individual footswitch handling (suppressed during dual hold) ------
-  if (!dual_held) {
-    fs1.Process(fs1_pressed, looper1);
-    fs2.Process(fs2_pressed, looper2);
-  } else {
-    // Pass false so individual hold timers reset and no actions fire while
-    // the dual-hold gesture is in progress.
-    fs1.Process(false, looper1);
-    fs2.Process(false, looper2);
-  }
+  // ---- Footswitch handling (hold-aware) --------------------------------
+  if (fs1.Process(hw.switches[Hothouse::FOOTSWITCH_1].Pressed(), looper1))
+    save_requested = true;
+  if (fs2.Process(hw.switches[Hothouse::FOOTSWITCH_2].Pressed(), looper2))
+    save_requested = true;
 
   // ---- Switch 3: signal routing ----------------------------------------
   auto sw3 = hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_3);
