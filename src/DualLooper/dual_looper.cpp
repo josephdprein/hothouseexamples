@@ -65,12 +65,16 @@ Hothouse hw;
 float DSY_SDRAM_BSS loop_buf_1[MAX_LOOP_SAMPLES];
 float DSY_SDRAM_BSS loop_buf_2[MAX_LOOP_SAMPLES];
 
-// Frozen zone: CCW extreme → FREEZE_HI (5% of travel)
-static constexpr float FREEZE_HI = 0.05f;
+// Half-speed (0.5×) grace zone: ~22.5% of travel ±2.5%
+static constexpr float HALF_LO  = 0.20f;
+static constexpr float HALF_HI  = 0.25f;
 
 // Unity-speed (1×) grace zone: ±5% around noon (center of travel)
 static constexpr float UNITY_LO = 0.45f;
 static constexpr float UNITY_HI = 0.55f;
+
+// Double-speed (2×) grace zone: top 5% of travel
+static constexpr float DOUBLE_LO = 0.95f;
 
 static constexpr float TWO_PI = 6.283185307f;
 static constexpr float SAMPLE_RATE_F = 48000.f;
@@ -94,37 +98,50 @@ static constexpr size_t XFADE_LEN = 128;
 // Speed knob → playback rate
 //
 // Zone layout (knob 0.0 = fully CCW, 1.0 = fully CW):
-//   0.00 – 0.05 : frozen (0×)          — CCW extreme
-//   0.05 – 0.45 : 0× → 1×             — slow ramp (0.5× lands ~25%)
-//   0.45 – 0.55 : 1× grace zone        — noon ±5%
-//   0.55 – 1.00 : 1× → 2×             — fast ramp
+//   0.00 – 0.20 : 0×  → 0.5×          — slow ramp
+//   0.20 – 0.25 : 0.5× grace zone      — half-speed (~22.5%)
+//   0.25 – 0.45 : 0.5× → 1×           — mid ramp
+//   0.45 – 0.55 : 1×  grace zone       — unity (noon ±5%)
+//   0.55 – 0.95 : 1×  → 2×            — fast ramp
+//   0.95 – 1.00 : 2×  grace zone       — double-speed (CW extreme)
 // ---------------------------------------------------------------------------
-static float KnobToSpeed(float knob, bool semitone_snap) {
+static float KnobToSpeed(float knob) {
   float speed;
 
-  if (knob < FREEZE_HI) {
-    return 0.0f;  // frozen zone — CCW extreme
+  if (knob < HALF_LO) {
+    // 0× at CCW → 0.5× at HALF_LO
+    float t = knob / HALF_LO;
+    speed = t * 0.5f;
+  } else if (knob <= HALF_HI) {
+    speed = 0.5f;  // half-speed grace zone
   } else if (knob < UNITY_LO) {
-    // Smooth ramp: 0× at FREEZE_HI, 1× at UNITY_LO
-    float t = (knob - FREEZE_HI) / (UNITY_LO - FREEZE_HI);
-    speed = t;
+    // 0.5× at HALF_HI → 1× at UNITY_LO
+    float t = (knob - HALF_HI) / (UNITY_LO - HALF_HI);
+    speed = 0.5f + t * 0.5f;
   } else if (knob <= UNITY_HI) {
     speed = 1.0f;  // unity grace zone — noon ±5%
-  } else {
-    // UNITY_HI → 1×,  1.0 → 2×
-    float t = (knob - UNITY_HI) / (1.0f - UNITY_HI);
+  } else if (knob < DOUBLE_LO) {
+    // 1× at UNITY_HI → 2× at DOUBLE_LO
+    float t = (knob - UNITY_HI) / (DOUBLE_LO - UNITY_HI);
     speed = 1.0f + t;
-  }
-
-  if (semitone_snap && speed > 0.01f) {
-    float semitones = 12.0f * log2f(speed);
-    semitones = roundf(semitones);
-    if (semitones < -12.0f) semitones = -12.0f;
-    if (semitones > 12.0f) semitones = 12.0f;
-    speed = powf(2.0f, semitones / 12.0f);
+  } else {
+    speed = 2.0f;  // double-speed grace zone — CW extreme
   }
 
   return speed;
+}
+
+// ---------------------------------------------------------------------------
+// Warble knob → stutter window length (samples) when SW is UP
+//
+// Exponential sweep so short windows (CD-skip) get fine resolution at CCW:
+//   CCW (0.0) → ~5 ms  = 240 samples
+//   CW  (1.0) → 2 s    = 96 000 samples
+// ---------------------------------------------------------------------------
+static float KnobToStutterLen(float knob) {
+  const float min_len = 240.0f;    // ~5 ms at 48 kHz
+  const float max_len = 96000.0f;  // 2 s  at 48 kHz
+  return min_len * powf(max_len / min_len, knob);
 }
 
 // ---------------------------------------------------------------------------
@@ -158,7 +175,11 @@ struct Looper {
   float level;
   float warble_depth;
   bool reverse;
-  bool semitone_snap;
+
+  // Stutter mode (SW UP): loops a short window of the buffer
+  bool  stutter_active;
+  float stutter_start_pos;   // read_pos captured when SW flips to UP
+  float stutter_window_len;  // window length in samples (set from warble knob)
 
   // Random warble — three filtered-noise bands per looper
   uint32_t rng_state;
@@ -189,7 +210,9 @@ struct Looper {
     level = 1.0f;
     warble_depth = 0.0f;
     reverse = false;
-    semitone_snap = false;
+    stutter_active = false;
+    stutter_start_pos = 0.0f;
+    stutter_window_len = 0.0f;
     rng_state = seed;
     noise_slow = 0.0f;
     noise_mid = 0.0f;
@@ -353,7 +376,20 @@ struct Looper {
     // Gating on `playing` means read_pos stays frozen during the fade-out
     // window after a stop, so the tail decays from a fixed position rather
     // than sweeping through the buffer while going quiet.
-    if (playing && effective_speed > 0.001f) {
+    if (stutter_active && playing && effective_speed > 0.001f) {
+      // Stutter mode: advance forward and loop within the captured window.
+      read_pos += effective_speed;
+      while (read_pos >= flen) read_pos -= flen;
+
+      // Distance travelled from stutter start (forward, wrapping loop boundary)
+      float dist = read_pos - stutter_start_pos;
+      if (dist < 0.0f) dist += flen;
+
+      // Clamp window to loop length so we never spin indefinitely on a short loop
+      float win = (stutter_window_len < flen) ? stutter_window_len : flen;
+      if (dist >= win) read_pos = stutter_start_pos;
+
+    } else if (!stutter_active && playing && effective_speed > 0.001f) {
       float prev_pos = read_pos;
       if (reverse) {
         read_pos -= effective_speed;
@@ -452,24 +488,44 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
   float k2 = hw.GetKnobValue(Hothouse::KNOB_2);
   float k3 = hw.GetKnobValue(Hothouse::KNOB_3);
 
+  static Hothouse::ToggleswitchPosition prev_sw1 = Hothouse::TOGGLESWITCH_MIDDLE;
   auto sw1 = hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_1);
-  looper1.semitone_snap = (sw1 == Hothouse::TOGGLESWITCH_UP);
+  if (sw1 == Hothouse::TOGGLESWITCH_UP && prev_sw1 != Hothouse::TOGGLESWITCH_UP) {
+    looper1.stutter_start_pos = looper1.read_pos;
+  }
+  prev_sw1 = sw1;
+  looper1.stutter_active = (sw1 == Hothouse::TOGGLESWITCH_UP);
   looper1.reverse = (sw1 == Hothouse::TOGGLESWITCH_DOWN);
-  looper1.speed = KnobToSpeed(k1, looper1.semitone_snap);
+  looper1.speed = KnobToSpeed(k1);
   looper1.level = k2;
-  looper1.warble_depth = k3;
+  if (sw1 == Hothouse::TOGGLESWITCH_UP) {
+    looper1.warble_depth     = 0.0f;
+    looper1.stutter_window_len = KnobToStutterLen(k3);
+  } else {
+    looper1.warble_depth = k3;
+  }
 
   // ---- Looper 2 knobs / switches --------------------------------------
   float k4 = hw.GetKnobValue(Hothouse::KNOB_4);
   float k5 = hw.GetKnobValue(Hothouse::KNOB_5);
   float k6 = hw.GetKnobValue(Hothouse::KNOB_6);
 
+  static Hothouse::ToggleswitchPosition prev_sw2 = Hothouse::TOGGLESWITCH_MIDDLE;
   auto sw2 = hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_2);
-  looper2.semitone_snap = (sw2 == Hothouse::TOGGLESWITCH_UP);
+  if (sw2 == Hothouse::TOGGLESWITCH_UP && prev_sw2 != Hothouse::TOGGLESWITCH_UP) {
+    looper2.stutter_start_pos = looper2.read_pos;
+  }
+  prev_sw2 = sw2;
+  looper2.stutter_active = (sw2 == Hothouse::TOGGLESWITCH_UP);
   looper2.reverse = (sw2 == Hothouse::TOGGLESWITCH_DOWN);
-  looper2.speed = KnobToSpeed(k4, looper2.semitone_snap);
+  looper2.speed = KnobToSpeed(k4);
   looper2.level = k5;
-  looper2.warble_depth = k6;
+  if (sw2 == Hothouse::TOGGLESWITCH_UP) {
+    looper2.warble_depth     = 0.0f;
+    looper2.stutter_window_len = KnobToStutterLen(k6);
+  } else {
+    looper2.warble_depth = k6;
+  }
 
   // ---- Per-sample processing -------------------------------------------
   for (size_t i = 0; i < size; ++i) {
