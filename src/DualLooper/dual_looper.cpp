@@ -174,7 +174,8 @@ struct Looper {
   float overdub_gain;
 
   // LED feedback blink request (set from audio ISR, consumed by main loop)
-  volatile int led_blink_count;
+  volatile int  led_blink_count;
+  volatile bool buffer_full;  // true once initial recording hits MAX_LOOP_SAMPLES
 
   void Init(float *buf, uint32_t seed) {
     buffer = buf;
@@ -197,6 +198,7 @@ struct Looper {
     fade_gain    = 0.0f;
     overdub_gain = 0.0f;
     led_blink_count = 0;
+    buffer_full     = false;
   }
 
   // --- Footswitch actions ------------------------------------------------
@@ -210,12 +212,14 @@ struct Looper {
     } else if (!has_loop && recording) {
       // (b) Set loop end, start playing clean (no auto-overdub)
       loop_length = rec_pos;
-      has_loop = (loop_length > 1);
+      // Require at least 2×XFADE_LEN samples so the crossfade regions never
+      // overlap and silence the whole buffer on very short loops (< ~5.3 ms).
+      has_loop = (loop_length > XFADE_LEN * 2);
       if (has_loop) {
         // Bake a short linear fade into both ends of the buffer so the loop
         // splice point is silent regardless of where the footswitch was pressed.
         // Uses at most XFADE_LEN samples per end; capped at loop_length/2 so
-        // the fade-in and fade-out regions never overlap on very short loops.
+        // the fade-in and fade-out regions never overlap.
         size_t xfade = (XFADE_LEN < loop_length / 2) ? XFADE_LEN : loop_length / 2;
         for (size_t i = 0; i < xfade; ++i) {
           float t = static_cast<float>(i) / static_cast<float>(xfade);
@@ -224,9 +228,13 @@ struct Looper {
         }
         playing = true;
         recording = false;
-        read_pos = 0.0f;
+        buffer_full = false;
+        // In reverse mode start at the tail so one-shot plays end→start
+        // without immediately tripping the wrap detector on the first sample.
+        read_pos = reverse ? static_cast<float>(loop_length - 1) : 0.0f;
       } else {
-        recording = false;  // too short, cancel
+        recording = false;  // too short (< ~5.3 ms), cancel
+        buffer_full = false;
       }
     } else if (has_loop && playing && !recording) {
       // (c) Playing → start overdub
@@ -235,8 +243,10 @@ struct Looper {
       // (d) Overdubbing → stop overdub, keep playing
       recording = false;
     } else if (has_loop && !playing) {
-      // (e) Stopped → start playing from beginning
-      read_pos = 0.0f;
+      // (e) Stopped → start playing from the appropriate end for the current
+      // direction so reverse one-shot plays end→start without immediately
+      // tripping the wrap detector on the very first sample.
+      read_pos = reverse ? static_cast<float>(loop_length - 1) : 0.0f;
       playing = true;
     }
   }
@@ -255,6 +265,7 @@ struct Looper {
     } else if (recording) {
       // Cancel recording in progress (no loop yet)
       recording = false;
+      buffer_full = false;
       led_blink_count = 1;
     }
     // else: idle, nothing to do
@@ -266,6 +277,7 @@ struct Looper {
       bool was_loop = has_loop;
       has_loop = false;
       recording = false;
+      buffer_full = false;
       loop_length = 0;
       rec_pos = 0;
       read_pos = 0.0f;
@@ -281,6 +293,11 @@ struct Looper {
     if (recording && !has_loop) {
       if (rec_pos < MAX_LOOP_SAMPLES) {
         buffer[rec_pos++] = in;
+      } else {
+        // Buffer cap reached — set flag so the LED can alert the user.
+        // Writes stop but recording state persists until the user commits
+        // (short press) or cancels (hold ≥1 s).
+        buffer_full = true;
       }
       fade_gain = 0.0f;
       return 0.0f;
@@ -447,6 +464,17 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
   bool route_l1_to_l2 = (sw3 == Hothouse::TOGGLESWITCH_UP);
   bool route_l2_to_l1 = (sw3 == Hothouse::TOGGLESWITCH_DOWN);
 
+  // Detect routing changes and mute looper inputs for this block if one
+  // occurred.  Flipping SW3 while recording or overdubbing would otherwise
+  // bake a hard step-function transient into the loop buffer; one block of
+  // silence (4 samples ≈ 83 µs) is inaudible but prevents the discontinuity.
+  static bool prev_route_l1_to_l2 = false;
+  static bool prev_route_l2_to_l1 = false;
+  bool route_changed = (route_l1_to_l2 != prev_route_l1_to_l2) ||
+                       (route_l2_to_l1 != prev_route_l2_to_l1);
+  prev_route_l1_to_l2 = route_l1_to_l2;
+  prev_route_l2_to_l1 = route_l2_to_l1;
+
   // ---- Looper 1 knobs / switches --------------------------------------
   float k1 = hw.GetKnobValue(Hothouse::KNOB_1);
   float k2 = hw.GetKnobValue(Hothouse::KNOB_2);
@@ -474,20 +502,26 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
   // ---- Per-sample processing -------------------------------------------
   for (size_t i = 0; i < size; ++i) {
     float dry = in[0][i];
+    // Zero looper inputs for the entire block when routing just changed to
+    // prevent a step-function from being written into the loop buffer.
+    float looper_dry = route_changed ? 0.0f : dry;
     float wet1, wet2;
 
     if (route_l1_to_l2) {
-      // Series: L1 records dry; L2 records L1's loop output
-      wet1 = looper1.Process(dry);
-      wet2 = looper2.Process(wet1);
+      // Series: L1 records dry input; L2 records L1's current output.
+      // L2 captures a snapshot of L1's audio at record time — after L2's
+      // loop is committed it plays that snapshot independently of L1.
+      wet1 = looper1.Process(looper_dry);
+      wet2 = looper2.Process(route_changed ? 0.0f : wet1);
     } else if (route_l2_to_l1) {
-      // Series: L2 records dry; L1 records L2's loop output
-      wet2 = looper2.Process(dry);
-      wet1 = looper1.Process(wet2);
+      // Series: L2 records dry input; L1 records L2's current output.
+      // Same snapshot semantics as above, roles reversed.
+      wet2 = looper2.Process(looper_dry);
+      wet1 = looper1.Process(route_changed ? 0.0f : wet2);
     } else {
       // Parallel: both loopers record dry independently
-      wet1 = looper1.Process(dry);
-      wet2 = looper2.Process(dry);
+      wet1 = looper1.Process(looper_dry);
+      wet2 = looper2.Process(looper_dry);
     }
 
     out[0][i] = out[1][i] = daisysp::SoftClip(dry + wet1 + wet2);
@@ -500,10 +534,15 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out,
 static void UpdateLed(Led &led, Looper &looper,
                       int &blink_remaining, int &blink_timer,
                       uint32_t tick) {
-  // Check for a new blink request from the audio ISR
+  // Check for a new blink request from the audio ISR.
+  // Disable IRQs for the read-zero pair: a 32-bit int read/write is atomic on
+  // Cortex-M but the read-test-write sequence is not, so without the guard the
+  // ISR could fire between the read and the zero-write and lose a blink count.
+  __disable_irq();
   int req = looper.led_blink_count;
+  if (req > 0) looper.led_blink_count = 0;
+  __enable_irq();
   if (req > 0) {
-    looper.led_blink_count = 0;
     blink_remaining = req;
     blink_timer = 0;
   }
@@ -517,11 +556,16 @@ static void UpdateLed(Led &led, Looper &looper,
       blink_remaining = 0;
     }
   } else if (looper.recording && !looper.has_loop) {
-    // Initial recording: fast blink (~12 Hz) — "commit carefully, loop point next"
-    led.Set((tick % 4 < 2) ? 1.0f : 0.0f);
+    // Initial recording: fast blink while capturing.  Once the 60-second buffer
+    // cap is hit (writes stop but state persists) switch to solid-on so the user
+    // knows to commit or cancel rather than continuing to record into the void.
+    led.Set(looper.buffer_full ? 1.0f : (tick % 4 < 2) ? 1.0f : 0.0f);
   } else if (looper.recording && looper.has_loop) {
-    // Overdubbing: slow pulse (~2.5 Hz) — "adding layers, relaxed"
-    led.Set((tick % 20 < 10) ? 1.0f : 0.0f);
+    // Overdubbing: slow pulse while audio is actively being written.
+    // When speed=0 (freeze zone) overdub_gain ramps to 0 — show solid instead
+    // so the LED does not imply recording when nothing is being captured.
+    bool writing = (looper.overdub_gain > 0.01f);
+    led.Set(writing ? ((tick % 20 < 10) ? 1.0f : 0.0f) : 1.0f);
   } else {
     led.Set(looper.playing ? 1.0f : 0.0f);
   }
